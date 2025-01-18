@@ -252,7 +252,7 @@ impl GameApp {
 
             // WebSocket Connection for Real-Time Updates with Retries
             let game_clone = self.game_service.get_game();
-            let server_url = format!("ws://127.0.0.1:3000/ws");
+            let server_url = format!("https://tic-tac-toe-multiplayer-jzxq.onrender.com");
             let game_id = self.game_id.clone();
 
             thread::spawn(move || {
