@@ -13,7 +13,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
