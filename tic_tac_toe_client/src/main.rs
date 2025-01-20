@@ -2,7 +2,8 @@ use eframe::egui;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::{thread, time::Duration};
+use std::thread;
+use tracing::info;
 use tungstenite::{connect, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,7 @@ pub struct Game {
     pub current_turn: Player,
     pub game_over: bool,
     pub draw: bool,
+    pub players: Vec<Player>,
 }
 
 impl Default for Game {
@@ -26,6 +28,7 @@ impl Default for Game {
             current_turn: Player::X,
             game_over: false,
             draw: false,
+            players: Vec::new(),
         }
     }
 }
@@ -49,6 +52,29 @@ impl GameService {
         Arc::clone(&self.game)
     }
 
+    pub fn create_game(&self) -> Result<String, String> {
+        let response = self
+            .client
+            .post(format!("{}/create_game", self.server_url))
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        response.json::<String>().map_err(|e| e.to_string())
+    }
+
+    pub fn join_game(&self, game_id: &str, player: Option<Player>) -> Result<Player, String> {
+        let response = self
+            .client
+            .post(format!("{}/join_game", self.server_url))
+            .json(&serde_json::json!({ "game_id": game_id, "player": player }))
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        response
+            .json::<Result<Player, String>>()
+            .map_err(|e| e.to_string())?
+    }
+
     pub fn fetch_game_state(&self, game_id: &str) -> Result<(), String> {
         let response = self
             .client
@@ -57,18 +83,36 @@ impl GameService {
             .send();
 
         response.map_err(|e| e.to_string()).and_then(|resp| {
-            let new_game = resp.json::<Game>().map_err(|e| e.to_string())?;
-            let mut game = self.game.lock().unwrap();
-            *game = new_game;
-            Ok(())
+            if resp.status().is_success() {
+                let new_game = resp.json::<Game>().map_err(|e| e.to_string())?;
+                let mut game = self.game.lock().unwrap();
+                *game = new_game;
+                info!("Fetched new game state for game ID: {}", game_id);
+                Ok(())
+            } else if resp.status() == 404 {
+                Err("Game not found. It may have expired.".to_string())
+            } else {
+                Err(format!("Server error: {}", resp.status()))
+            }
         })
     }
 
-    pub fn make_move(&self, game_id: &str, row: usize, col: usize) -> Result<(), String> {
+    pub fn make_move(
+        &self,
+        game_id: &str,
+        player: Player,
+        row: usize,
+        col: usize,
+    ) -> Result<(), String> {
         let response = self
             .client
             .post(format!("{}/make_move", self.server_url))
-            .json(&serde_json::json!({ "game_id": game_id, "x": row, "y": col }))
+            .json(&serde_json::json!({
+                "game_id": game_id,
+                "player": player,
+                "x": row,
+                "y": col
+            }))
             .send();
 
         response.map_err(|e| e.to_string()).and_then(|resp| {
@@ -91,11 +135,35 @@ impl GameService {
             if resp.status().is_success() {
                 let mut game = self.game.lock().unwrap();
                 *game = Game::default();
+                info!("Game with ID: {} has been reset", game_id);
                 Ok(())
             } else {
                 Err(format!("Server error: {}", resp.status()))
             }
         })
+    }
+
+    pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
+        let game_clone = self.get_game();
+        let server_url = format!("ws://0.0.0.0:3000/ws");
+
+        thread::spawn(move || {
+            if let Ok((mut socket, _)) = connect(server_url) {
+                while let Ok(msg) = socket.read() {
+                    if let Message::Text(text) = msg {
+                        if let Ok((received_game_id, received_game)) =
+                            serde_json::from_str::<(String, Game)>(&text)
+                        {
+                            if received_game_id == game_id {
+                                let mut game = game_clone.lock().unwrap();
+                                *game = received_game;
+                                ctx.request_repaint(); // Use the cloned Arc<egui::Context>
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -106,19 +174,19 @@ pub struct GameApp {
     joined: bool,
     loading: bool,
     error_message: Option<String>,
+    player: Option<Player>,
 }
 
 impl Default for GameApp {
     fn default() -> Self {
         Self {
-            game_service: GameService::new(
-                "https://tic-tac-toe-multiplayer-jzxq.onrender.com".to_string(),
-            ),
+            game_service: GameService::new("http://0.0.0.0:3000".to_string()),
             game_id: String::new(),
             input_game_id: String::new(),
             joined: false,
             loading: false,
             error_message: None,
+            player: None,
         }
     }
 }
@@ -131,19 +199,54 @@ impl eframe::App for GameApp {
                     ui.set_width(400.0);
                     ui.set_height(500.0);
 
-                    // Join Game Section
-                    ui.vertical_centered(|ui| {
-                        ui.label("Game ID:");
-                        ui.text_edit_singleline(&mut self.input_game_id);
-                        if ui
-                            .add_enabled(!self.loading, egui::Button::new("Join Game"))
-                            .clicked()
-                        {
-                            if !self.input_game_id.is_empty() {
-                                self.join_game();
+                    // Create Game Section
+                    if ui.button("Create Game").clicked() {
+                        match self.game_service.create_game() {
+                            Ok(game_id) => {
+                                self.game_id = game_id;
+                                self.input_game_id = self.game_id.clone();
+                                info!("New game created with ID: {}", self.game_id);
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Error creating game: {}", e));
                             }
                         }
-                    });
+                    }
+
+                    // Join Game Section
+                    ui.label("Game ID:");
+                    ui.text_edit_singleline(&mut self.input_game_id);
+                    if ui
+                        .add_enabled(!self.loading, egui::Button::new("Join Game"))
+                        .clicked()
+                    {
+                        if !self.input_game_id.is_empty() {
+                            info!(
+                                "Join game button clicked with game ID: {}",
+                                self.input_game_id
+                            );
+                            self.join_game(ctx);
+                        }
+                    }
+
+                    ui.add_space(20.0);
+
+                    // Player Selection Section
+                    if self.player.is_none() {
+                        ui.label("Select Your Player:");
+                        if ui.button("Play as X").clicked() {
+                            match self.game_service.join_game(&self.game_id, Some(Player::X)) {
+                                Ok(player) => self.player = Some(player),
+                                Err(e) => self.error_message = Some(format!("Error: {}", e)),
+                            }
+                        }
+                        if ui.button("Play as O").clicked() {
+                            match self.game_service.join_game(&self.game_id, Some(Player::O)) {
+                                Ok(player) => self.player = Some(player),
+                                Err(e) => self.error_message = Some(format!("Error: {}", e)),
+                            }
+                        }
+                    }
 
                     ui.add_space(20.0);
 
@@ -154,7 +257,7 @@ impl eframe::App for GameApp {
                     }
 
                     // Game Board and Status
-                    if self.joined {
+                    if self.joined && self.player.is_some() {
                         self.render_board(ui);
                         ui.add_space(20.0);
                         self.display_game_status(ui);
@@ -166,7 +269,7 @@ impl eframe::App for GameApp {
                                     egui::Button::new(
                                         egui::RichText::new("Reset Game")
                                             .size(30.0)
-                                            .color(egui::Color32::from_rgb(240, 148, 0)), // Orange
+                                            .color(egui::Color32::from_rgb(240, 148, 0)),
                                     ),
                                 )
                                 .clicked()
@@ -193,7 +296,9 @@ impl GameApp {
                     for col in 0..3 {
                         let cell = game.lock().unwrap().board[row][col];
                         let button = ui.add_enabled(
-                            !game.lock().unwrap().game_over,
+                            !game.lock().unwrap().game_over
+                                && self.player.is_some()
+                                && self.player.unwrap() == game.lock().unwrap().current_turn,
                             egui::Button::new(match cell {
                                 Some(Player::X) => egui::RichText::new("X")
                                     .size(50.0)
@@ -209,7 +314,7 @@ impl GameApp {
                         );
 
                         if button.clicked() && cell.is_none() {
-                            self.make_move(row, col);
+                            self.make_move(self.player.unwrap(), row, col);
                         }
                     }
                 });
@@ -242,58 +347,40 @@ impl GameApp {
         }
     }
 
-    fn join_game(&mut self) {
+    fn join_game(&mut self, ctx: &egui::Context) {
         self.loading = true;
         self.error_message = None;
         self.game_id = self.input_game_id.clone();
 
-        if self.game_service.fetch_game_state(&self.game_id).is_ok() {
-            self.joined = true;
+        info!("Attempting to join game with ID: {}", self.game_id);
 
-            // WebSocket Connection for Real-Time Updates with Retries
-            let game_clone = self.game_service.get_game();
-            let server_url = format!("https://tic-tac-toe-multiplayer-jzxq.onrender.com");
-            let game_id = self.game_id.clone();
+        match self.game_service.join_game(&self.game_id, None) {
+            Ok(player) => {
+                self.player = Some(player);
+                self.joined = true;
+                self.game_service.fetch_game_state(&self.game_id).unwrap();
 
-            thread::spawn(move || {
-                let mut retries = 0;
-
-                loop {
-                    if let Ok((mut socket, _)) = connect(server_url.clone()) {
-                        while let Ok(msg) = socket.read() {
-                            if let Message::Text(text) = msg {
-                                if let Ok((received_game_id, received_game)) =
-                                    serde_json::from_str::<(String, Game)>(&text)
-                                {
-                                    if received_game_id == game_id {
-                                        let mut game = game_clone.lock().unwrap();
-                                        *game = received_game;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        retries += 1;
-                        if retries > 5 {
-                            eprintln!("WebSocket connection failed after retries.");
-                            break;
-                        }
-                        thread::sleep(Duration::from_secs(2 * retries)); // Exponential backoff
-                    }
-                }
-            });
-        } else {
-            self.error_message = Some("Failed to join game. Please check the Game ID.".to_string());
+                // Wrap the context in an Arc before passing it
+                self.game_service
+                    .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
+                info!("Successfully joined game with ID: {}", self.game_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to join game: {}", e));
+            }
         }
+
         self.loading = false;
     }
 
-    fn make_move(&mut self, row: usize, col: usize) {
+    fn make_move(&mut self, player: Player, row: usize, col: usize) {
         if self.loading {
             return;
         }
 
-        if let Err(e) = self.game_service.make_move(&self.game_id, row, col) {
+        info!("Player {:?} making move at ({}, {})", player, row, col);
+
+        if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
             self.error_message = Some(format!("Error making move: {}", e));
         }
     }
@@ -301,6 +388,8 @@ impl GameApp {
     fn reset_game(&mut self) {
         self.loading = true;
         self.error_message = None;
+
+        info!("Resetting game with ID: {}", self.game_id);
 
         if let Err(e) = self.game_service.reset_game(&self.game_id) {
             self.error_message = Some(format!("Error resetting game: {}", e));
