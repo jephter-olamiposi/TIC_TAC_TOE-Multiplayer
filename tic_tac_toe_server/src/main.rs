@@ -155,42 +155,41 @@ async fn join_game_handler(
 ) -> Json<Result<Player, String>> {
     let mut games = state.games.write().unwrap();
 
-    // Fetch or initialize the game
-    let game = games.entry(req.game_id.clone()).or_default();
+    // Retrieve or initialize the game
+    let game = games
+        .entry(req.game_id.clone())
+        .or_insert_with(Game::default);
 
-    // Check if the game already has two players
+    // Check if the game is full
     if game.players.len() >= 2 {
-        error!(
-            "Join game failed: Game {} already has two players.",
-            req.game_id
-        );
+        error!("Join game failed: Game {} is already full.", req.game_id);
         return Json(Err("Game is already full.".to_string()));
     }
 
-    // Handle requested player assignment
-    if let Some(player) = req.player {
-        if game.players.contains(&player) {
+    // Handle explicit player symbol requests
+    if let Some(requested_player) = req.player {
+        if game.players.contains(&requested_player) {
             // Requested player is already taken
             error!(
-                "Join game failed: Player {:?} is already taken in game {}.",
-                player, req.game_id
+                "Join game failed: Player {:?} already taken in game {}.",
+                requested_player, req.game_id
             );
             return Json(Err(format!(
                 "Player {:?} is already taken. Choose a different symbol.",
-                player
+                requested_player
             )));
         }
 
-        // Assign requested player
-        game.players.push(player);
+        // Assign the requested player
+        game.players.push(requested_player);
         info!(
-            "Player {:?} successfully joined game {}.",
-            player, req.game_id
+            "Player {:?} successfully joined game {} as the first player.",
+            requested_player, req.game_id
         );
-        return Json(Ok(player));
+        return Json(Ok(requested_player));
     }
 
-    // Automatic player assignment if none is specified
+    // Automatically assign the opposite symbol for the second player
     let assigned_player = if game.players.contains(&Player::X) {
         Player::O
     } else {
@@ -199,7 +198,7 @@ async fn join_game_handler(
 
     game.players.push(assigned_player);
     info!(
-        "Player {:?} automatically assigned to game {}.",
+        "Player {:?} automatically assigned to game {} as the second player.",
         assigned_player, req.game_id
     );
     Json(Ok(assigned_player))

@@ -64,50 +64,60 @@ impl GameService {
     }
 
     pub fn join_game(&self, game_id: &str, player: Option<Player>) -> Result<Player, String> {
+        // Debug log to confirm the client's intent to join
         debug!(
-            "Attempting to join game ID: {} with player: {:?}",
+            "Attempting to join game ID: {} with requested player: {:?}",
             game_id, player
         );
 
+        // Send the join request to the server
         let response = self
             .client
             .post(format!("{}/join_game", self.server_url))
             .json(&serde_json::json!({ "game_id": game_id, "player": player }))
             .send();
 
+        // Handle the response
         response
             .map_err(|e| {
-                error!("Network error while joining game: {}", e);
+                // Log network errors
+                error!("Network error while trying to join game: {}", e);
                 e.to_string()
             })
             .and_then(|resp| {
                 if resp.status().is_success() {
-                    let assigned_player = resp.json::<Result<Player, String>>().map_err(|e| {
-                        error!("Error parsing join game response: {}", e);
-                        e.to_string()
-                    })?;
-
-                    match assigned_player {
-                        Ok(player) => {
-                            info!(
-                                "Successfully joined game ID: {} as player {:?}",
-                                game_id, player
-                            );
-                            Ok(player)
-                        }
-                        Err(err) => {
-                            error!("Server rejected join game request: {}", err);
-                            Err(err)
-                        }
-                    }
+                    // Parse the server's response to check the assigned player
+                    resp.json::<Result<Player, String>>()
+                        .map_err(|e| {
+                            error!("Failed to parse join game response: {}", e);
+                            e.to_string()
+                        })
+                        .and_then(|assigned_player| match assigned_player {
+                            Ok(player) => {
+                                info!(
+                                    "Successfully joined game ID: {} as player {:?}",
+                                    game_id, player
+                                );
+                                Ok(player)
+                            }
+                            Err(err) => {
+                                // Log server-side rejection reasons
+                                error!(
+                                    "Join game request rejected by server for game ID {}: {}",
+                                    game_id, err
+                                );
+                                Err(err)
+                            }
+                        })
                 } else {
+                    // Handle non-successful HTTP statuses
                     error!(
-                        "Failed to join game ID: {}. Server responded with status: {}",
-                        game_id,
-                        resp.status()
+                        "Server responded with status {} when attempting to join game ID: {}",
+                        resp.status(),
+                        game_id
                     );
                     Err(format!(
-                        "Failed to join game: Server error (status {})",
+                        "Failed to join game: Server returned error status {}",
                         resp.status()
                     ))
                 }
@@ -297,13 +307,12 @@ impl eframe::App for GameApp {
                     // Player Selection Section
                     if self.player.is_none() {
                         ui.label("Select Your Player:");
-
-                        // Assign Player X
                         if ui.button("Play as X").clicked() {
                             match self.game_service.join_game(&self.game_id, Some(Player::X)) {
                                 Ok(player) => {
                                     if player == Player::X {
                                         self.player = Some(Player::X);
+                                        info!("Assigned Player X to game {}", self.game_id);
                                     } else {
                                         self.error_message =
                                             Some("Failed to assign Player X.".to_string());
@@ -315,12 +324,12 @@ impl eframe::App for GameApp {
                             }
                         }
 
-                        // Assign Player O
                         if ui.button("Play as O").clicked() {
                             match self.game_service.join_game(&self.game_id, Some(Player::O)) {
                                 Ok(player) => {
                                     if player == Player::O {
                                         self.player = Some(Player::O);
+                                        info!("Player O successfully assigned.");
                                     } else {
                                         self.error_message =
                                             Some("Failed to assign Player O.".to_string());
