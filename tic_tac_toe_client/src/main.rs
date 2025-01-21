@@ -194,7 +194,7 @@ impl GameService {
 
     pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
         let game_clone = self.get_game();
-        let server_url = format!("ws://0.0.0.0:3000/ws");
+        let server_url = format!("ws://tic-tac-toe-multiplayer-jzxq.onrender.com/ws");
 
         thread::spawn(move || {
             let mut retries = 0;
@@ -253,7 +253,9 @@ pub struct GameApp {
 impl Default for GameApp {
     fn default() -> Self {
         Self {
-            game_service: GameService::new("http://0.0.0.0:3000".to_string()),
+            game_service: GameService::new(
+                "https://tic-tac-toe-multiplayer-jzxq.onrender.com".to_string(),
+            ),
             game_id: String::new(),
             input_game_id: String::new(),
             joined: false,
