@@ -3,7 +3,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::info;
+use std::time::Duration;
+use tracing::{debug, error, info};
 use tungstenite::{connect, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,16 +64,54 @@ impl GameService {
     }
 
     pub fn join_game(&self, game_id: &str, player: Option<Player>) -> Result<Player, String> {
+        debug!(
+            "Attempting to join game ID: {} with player: {:?}",
+            game_id, player
+        );
+
         let response = self
             .client
             .post(format!("{}/join_game", self.server_url))
             .json(&serde_json::json!({ "game_id": game_id, "player": player }))
-            .send()
-            .map_err(|e| e.to_string())?;
+            .send();
 
         response
-            .json::<Result<Player, String>>()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                error!("Network error while joining game: {}", e);
+                e.to_string()
+            })
+            .and_then(|resp| {
+                if resp.status().is_success() {
+                    let assigned_player = resp.json::<Result<Player, String>>().map_err(|e| {
+                        error!("Error parsing join game response: {}", e);
+                        e.to_string()
+                    })?;
+
+                    match assigned_player {
+                        Ok(player) => {
+                            info!(
+                                "Successfully joined game ID: {} as player {:?}",
+                                game_id, player
+                            );
+                            Ok(player)
+                        }
+                        Err(err) => {
+                            error!("Server rejected join game request: {}", err);
+                            Err(err)
+                        }
+                    }
+                } else {
+                    error!(
+                        "Failed to join game ID: {}. Server responded with status: {}",
+                        game_id,
+                        resp.status()
+                    );
+                    Err(format!(
+                        "Failed to join game: Server error (status {})",
+                        resp.status()
+                    ))
+                }
+            })
     }
 
     pub fn fetch_game_state(&self, game_id: &str) -> Result<(), String> {
@@ -148,20 +187,44 @@ impl GameService {
         let server_url = format!("ws://0.0.0.0:3000/ws");
 
         thread::spawn(move || {
-            if let Ok((mut socket, _)) = connect(server_url) {
-                while let Ok(msg) = socket.read() {
-                    if let Message::Text(text) = msg {
-                        if let Ok((received_game_id, received_game)) =
-                            serde_json::from_str::<(String, Game)>(&text)
-                        {
-                            if received_game_id == game_id {
-                                let mut game = game_clone.lock().unwrap();
-                                *game = received_game;
-                                ctx.request_repaint(); // Use the cloned Arc<egui::Context>
+            let mut retries = 0;
+            let max_retries = 5;
+            let backoff_duration = Duration::from_secs(2);
+
+            while retries < max_retries {
+                if let Ok((mut socket, _)) = connect(&server_url) {
+                    info!("WebSocket connection established for game ID: {}", game_id);
+                    retries = 0;
+
+                    while let Ok(msg) = socket.read() {
+                        if let Message::Text(text) = msg {
+                            if let Ok((received_game_id, received_game)) =
+                                serde_json::from_str::<(String, Game)>(&text)
+                            {
+                                if received_game_id == game_id {
+                                    let mut game = game_clone.lock().unwrap();
+                                    *game = received_game;
+                                    ctx.request_repaint();
+                                    info!("Game state updated for game ID: {}", game_id);
+                                }
                             }
                         }
                     }
+                } else {
+                    retries += 1;
+                    error!(
+                        "WebSocket connection failed for game ID: {}. Retry {}/{}",
+                        game_id, retries, max_retries
+                    );
+                    thread::sleep(backoff_duration * retries as u32);
                 }
+            }
+
+            if retries >= max_retries {
+                error!(
+                    "WebSocket connection failed after {} retries for game ID: {}",
+                    max_retries, game_id
+                );
             }
         });
     }
@@ -234,16 +297,38 @@ impl eframe::App for GameApp {
                     // Player Selection Section
                     if self.player.is_none() {
                         ui.label("Select Your Player:");
+
+                        // Assign Player X
                         if ui.button("Play as X").clicked() {
                             match self.game_service.join_game(&self.game_id, Some(Player::X)) {
-                                Ok(player) => self.player = Some(player),
-                                Err(e) => self.error_message = Some(format!("Error: {}", e)),
+                                Ok(player) => {
+                                    if player == Player::X {
+                                        self.player = Some(Player::X);
+                                    } else {
+                                        self.error_message =
+                                            Some("Failed to assign Player X.".to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Error: {}", e));
+                                }
                             }
                         }
+
+                        // Assign Player O
                         if ui.button("Play as O").clicked() {
                             match self.game_service.join_game(&self.game_id, Some(Player::O)) {
-                                Ok(player) => self.player = Some(player),
-                                Err(e) => self.error_message = Some(format!("Error: {}", e)),
+                                Ok(player) => {
+                                    if player == Player::O {
+                                        self.player = Some(Player::O);
+                                    } else {
+                                        self.error_message =
+                                            Some("Failed to assign Player O.".to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Error: {}", e));
+                                }
                             }
                         }
                     }
