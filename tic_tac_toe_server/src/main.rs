@@ -6,9 +6,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    env,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -331,11 +333,18 @@ async fn main() {
         .layer(cors)
         .with_state(Arc::clone(&app_state));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    // Use the PORT environment variable provided by Render
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+
+    let listener = TcpListener::bind(&addr)
         .await
         .expect("Failed to bind to address");
-    info!("Listening on {}", listener.local_addr().unwrap());
+
+    info!("Server is running on {}", listener.local_addr().unwrap());
 
     tokio::spawn(cleanup_inactive_games(Arc::clone(&app_state)));
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service())
+        .await
+        .unwrap();
 }
