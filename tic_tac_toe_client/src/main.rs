@@ -194,7 +194,7 @@ impl GameService {
 
     pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
         let game_clone = self.get_game();
-        let server_url = format!("ws://tic-tac-toe-multiplayer-jzxq.onrender.com/ws");
+        let server_url = "wss://tic-tac-toe-multiplayer-jzxq.onrender.com/ws".to_string();
 
         thread::spawn(move || {
             let mut retries = 0;
