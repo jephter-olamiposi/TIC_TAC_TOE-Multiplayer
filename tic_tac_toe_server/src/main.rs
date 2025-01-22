@@ -160,7 +160,7 @@ async fn join_game_handler(
         return Json(Err("Game is already full.".to_string()));
     }
 
-    let assigned_player = if let Some(requested_player) = req.player {
+    if let Some(requested_player) = req.player {
         if game.players.contains(&requested_player) {
             error!(
                 "Join game failed: Player {:?} already taken in game {}.",
@@ -171,31 +171,46 @@ async fn join_game_handler(
                 requested_player
             )));
         }
-        requested_player
-    } else {
-        if game.players.contains(&Player::X) {
-            Player::O
-        } else {
-            Player::X
+        game.players.push(requested_player);
+        info!(
+            "Player {:?} successfully joined game {} as the first player.",
+            requested_player, req.game_id
+        );
+
+        // Broadcast the game state update
+        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+            error!(
+                "Failed to broadcast updated game state after player joined: {:?}",
+                e
+            );
         }
+
+        return Json(Ok(requested_player));
+    }
+
+    let assigned_player = if game.players.contains(&Player::X) {
+        Player::O
+    } else {
+        Player::X
     };
 
     game.players.push(assigned_player);
     info!(
-        "Player {:?} successfully joined game {}.",
+        "Player {:?} automatically assigned to game {} as the second player.",
         assigned_player, req.game_id
     );
 
-    // Broadcast updated state after player joins
+    // Broadcast the game state update
     if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
         error!(
-            "Failed to broadcast updated game state after player joined: {}",
+            "Failed to broadcast updated game state after player joined: {:?}",
             e
         );
     }
 
     Json(Ok(assigned_player))
 }
+
 async fn get_state_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
@@ -224,8 +239,10 @@ async fn make_move_handler(
             "Move made: game_id={}, player={:?}, position=({}, {})",
             req.game_id, req.player, req.x, req.y
         );
+
+        // Broadcast the game state update
         if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
-            error!("Failed to broadcast game update: {}", e);
+            error!("Failed to broadcast game update: {:?}", e);
         }
     } else {
         error!("Move failed: game_id={}, error={:?}", req.game_id, result);
@@ -316,11 +333,11 @@ async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String>
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    let (tx, _) = broadcast::channel(100); // Set the buffer size to 100 (or larger if needed)
 
-    let (tx, _) = broadcast::channel(100);
     let app_state = Arc::new(AppState {
         games: Arc::new(RwLock::new(HashMap::new())),
-        tx,
+        tx: tx.clone(), // Ensure a reference to `tx` is retained here
     });
 
     let cors = CorsLayer::new()
