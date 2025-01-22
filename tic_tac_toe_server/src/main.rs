@@ -12,6 +12,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -269,34 +270,39 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
     info!("WebSocket upgrade request received");
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
-
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection established");
     let mut rx = state.tx.subscribe();
+    let mut interval = tokio::time::interval(Duration::from_secs(30)); // Keep-alive interval
 
-    while let Ok((game_id, game)) = rx.recv().await {
-        info!("Broadcasting update for game_id: {}", game_id);
+    loop {
+        tokio::select! {
+            // Handle game updates
+            update = rx.recv() => {
+                if let Ok((game_id, game)) = update {
+                    let message = match serde_json::to_string(&(game_id, game)) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!("Failed to serialize game state: {}", e);
+                            continue;
+                        }
+                    };
 
-        let message = match serde_json::to_string(&(game_id.clone(), game)) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!(
-                    "Failed to serialize game state: game_id={}, error={}",
-                    game_id, e
-                );
-                continue;
+                    if socket.send(axum::extract::ws::Message::Text(message.into())).await.is_err() {
+                        error!("WebSocket connection dropped");
+                        break;
+                    }
+                }
             }
-        };
-
-        if socket
-            .send(axum::extract::ws::Message::Text(message.into()))
-            .await
-            .is_err()
-        {
-            error!("WebSocket connection dropped for game_id: {}", game_id);
-            break;
+            // Send periodic keep-alive pings
+            _ = interval.tick() => {
+                if socket.send(axum::extract::ws::Message::Ping(vec![].into())).await.is_err() {
+                    error!("Failed to send ping, closing connection");
+                    break;
+                }
+            }
         }
     }
 
@@ -333,7 +339,7 @@ async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String>
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let (tx, _) = broadcast::channel(100); // Set the buffer size to 100 (or larger if needed)
+    let (tx, _) = broadcast::channel(1000);
 
     let app_state = Arc::new(AppState {
         games: Arc::new(RwLock::new(HashMap::new())),
