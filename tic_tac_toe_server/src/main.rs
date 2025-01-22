@@ -346,7 +346,5 @@ async fn main() {
     info!("Server is running on {}", listener.local_addr().unwrap());
 
     tokio::spawn(cleanup_inactive_games(Arc::clone(&app_state)));
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
