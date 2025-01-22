@@ -14,3 +14,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.26.1"
 uuid = { version = "1.12.1", features = ["v4"] }
 tower-http = { version = "0.6.2", features = ["cors"] }
+redis =  { version = "0.28", features = ["aio","tokio-comp"] }
+redis_cluster_async = "0.8.1"
+futures-util = "0.3"

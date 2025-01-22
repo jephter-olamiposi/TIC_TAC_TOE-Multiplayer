@@ -184,7 +184,9 @@ impl GameService {
 
     pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
         let game_clone = self.get_game();
-        let server_url = "wss://tic-tac-toe-multiplayer-zg0e.onrender.com/ws".to_string();
+
+        // Dynamically construct WebSocket URL
+        let websocket_url = format!("{}/ws", self.server_url.replace("https", "wss"));
 
         thread::spawn(move || {
             let mut retries = 0;
@@ -192,7 +194,7 @@ impl GameService {
             let backoff_duration = Duration::from_secs(2);
 
             loop {
-                match connect(&server_url) {
+                match connect(&websocket_url) {
                     Ok((mut socket, _)) => {
                         info!("WebSocket connection established for game ID: {}", game_id);
 
@@ -254,7 +256,11 @@ impl GameService {
                         }
 
                         // Wait before retrying
-                        thread::sleep(backoff_duration * retries as u32);
+                        let capped_backoff = std::cmp::min(
+                            backoff_duration * retries as u32,
+                            Duration::from_secs(30),
+                        );
+                        thread::sleep(capped_backoff);
                     }
                 }
             }
