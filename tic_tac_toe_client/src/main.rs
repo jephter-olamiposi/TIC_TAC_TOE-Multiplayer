@@ -64,60 +64,50 @@ impl GameService {
     }
 
     pub fn join_game(&self, game_id: &str, player: Option<Player>) -> Result<Player, String> {
-        // Debug log to confirm the client's intent to join
         debug!(
-            "Attempting to join game ID: {} with requested player: {:?}",
+            "Attempting to join game ID: {} with player: {:?}",
             game_id, player
         );
 
-        // Send the join request to the server
         let response = self
             .client
             .post(format!("{}/join_game", self.server_url))
             .json(&serde_json::json!({ "game_id": game_id, "player": player }))
             .send();
 
-        // Handle the response
         response
             .map_err(|e| {
-                // Log network errors
-                error!("Network error while trying to join game: {}", e);
+                error!("Network error while joining game: {}", e);
                 e.to_string()
             })
             .and_then(|resp| {
                 if resp.status().is_success() {
-                    // Parse the server's response to check the assigned player
-                    resp.json::<Result<Player, String>>()
-                        .map_err(|e| {
-                            error!("Failed to parse join game response: {}", e);
-                            e.to_string()
-                        })
-                        .and_then(|assigned_player| match assigned_player {
-                            Ok(player) => {
-                                info!(
-                                    "Successfully joined game ID: {} as player {:?}",
-                                    game_id, player
-                                );
-                                Ok(player)
-                            }
-                            Err(err) => {
-                                // Log server-side rejection reasons
-                                error!(
-                                    "Join game request rejected by server for game ID {}: {}",
-                                    game_id, err
-                                );
-                                Err(err)
-                            }
-                        })
+                    let assigned_player = resp.json::<Result<Player, String>>().map_err(|e| {
+                        error!("Error parsing join game response: {}", e);
+                        e.to_string()
+                    })?;
+
+                    match assigned_player {
+                        Ok(player) => {
+                            info!(
+                                "Successfully joined game ID: {} as player {:?}",
+                                game_id, player
+                            );
+                            Ok(player)
+                        }
+                        Err(err) => {
+                            error!("Server rejected join game request: {}", err);
+                            Err(err)
+                        }
+                    }
                 } else {
-                    // Handle non-successful HTTP statuses
                     error!(
-                        "Server responded with status {} when attempting to join game ID: {}",
-                        resp.status(),
-                        game_id
+                        "Failed to join game ID: {}. Server responded with status: {}",
+                        game_id,
+                        resp.status()
                     );
                     Err(format!(
-                        "Failed to join game: Server returned error status {}",
+                        "Failed to join game: Server error (status {})",
                         resp.status()
                     ))
                 }
@@ -194,7 +184,7 @@ impl GameService {
 
     pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
         let game_clone = self.get_game();
-        let server_url = "wss://tic-tac-toe-multiplayer-jzxq.onrender.com/ws".to_string();
+        let server_url = "wss://tic-tac-toe-multiplayer-zg0e.onrender.com/ws".to_string();
 
         thread::spawn(move || {
             let mut retries = 0;
@@ -222,6 +212,7 @@ impl GameService {
                     }
                 } else {
                     retries += 1;
+
                     error!(
                         "WebSocket connection failed for game ID: {}. Retry {}/{}",
                         game_id, retries, max_retries
@@ -254,7 +245,7 @@ impl Default for GameApp {
     fn default() -> Self {
         Self {
             game_service: GameService::new(
-                "https://tic-tac-toe-multiplayer-jzxq.onrender.com".to_string(),
+                "https://tic-tac-toe-multiplayer-zg0e.onrender.com".to_string(),
             ),
             game_id: String::new(),
             input_game_id: String::new(),
@@ -331,7 +322,7 @@ impl eframe::App for GameApp {
                                 Ok(player) => {
                                     if player == Player::O {
                                         self.player = Some(Player::O);
-                                        info!("Player O successfully assigned.");
+                                        info!("Assigned Player O to game {}", self.game_id);
                                     } else {
                                         self.error_message =
                                             Some("Failed to assign Player O.".to_string());

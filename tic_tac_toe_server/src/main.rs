@@ -12,6 +12,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -266,6 +267,7 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppS
     let mut rx = state.tx.subscribe();
 
     while let Ok((game_id, game)) = rx.recv().await {
+        info!("Broadcasting update for game_id: {}", game_id);
         if socket
             .send(axum::extract::ws::Message::Text(
                 serde_json::to_string(&(game_id, game)).unwrap().into(),
@@ -318,10 +320,10 @@ async fn main() {
         tx,
     });
 
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
         .route("/create_game", post(create_game_handler))
