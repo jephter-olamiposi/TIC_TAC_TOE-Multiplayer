@@ -1,18 +1,19 @@
-use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Json, State, WebSocketUpgrade},
     routing::{get, post},
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, sync::Arc, time::SystemTime};
-use tokio::{
-    net::TcpListener,
-    sync::{broadcast, mpsc, Mutex, RwLock},
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime},
 };
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,17 +52,20 @@ impl Game {
     }
 
     fn make_move(&mut self, player: Player, x: usize, y: usize) -> Result<(), String> {
-        debug!("Processing move for player {:?} at ({}, {})", player, x, y);
         if self.game_over {
+            debug!("Move rejected: Game is already over.");
             return Err("Game is over!".to_string());
         }
         if self.current_turn != player {
+            debug!("Move rejected: Not {:?}'s turn.", player);
             return Err(format!("It's not {:?}'s turn.", player));
         }
         if x >= 3 || y >= 3 {
+            debug!("Move rejected: Coordinates out of bounds.");
             return Err("Out of bounds".to_string());
         }
         if self.board[x][y].is_some() {
+            debug!("Move rejected: Cell already taken.");
             return Err("Cell already taken".to_string());
         }
 
@@ -69,14 +73,17 @@ impl Game {
 
         if self.check_winner().is_some() {
             self.game_over = true;
+            debug!("Game over: {:?} wins.", player);
         } else if self.is_full() {
             self.game_over = true;
             self.draw = true;
+            debug!("Game over: It's a draw.");
         } else {
             self.current_turn = match self.current_turn {
                 Player::X => Player::O,
                 Player::O => Player::X,
             };
+            debug!("Turn switched: Now it's {:?}'s turn.", self.current_turn);
         }
 
         self.last_activity = SystemTime::now();
@@ -86,18 +93,26 @@ impl Game {
     fn check_winner(&self) -> Option<Player> {
         for i in 0..3 {
             if self.board[i][0] == self.board[i][1] && self.board[i][1] == self.board[i][2] {
-                return self.board[i][0];
+                if let Some(player) = self.board[i][0] {
+                    return Some(player);
+                }
             }
             if self.board[0][i] == self.board[1][i] && self.board[1][i] == self.board[2][i] {
-                return self.board[0][i];
+                if let Some(player) = self.board[0][i] {
+                    return Some(player);
+                }
             }
         }
 
         if self.board[0][0] == self.board[1][1] && self.board[1][1] == self.board[2][2] {
-            return self.board[0][0];
+            if let Some(player) = self.board[0][0] {
+                return Some(player);
+            }
         }
         if self.board[0][2] == self.board[1][1] && self.board[1][1] == self.board[2][0] {
-            return self.board[0][2];
+            if let Some(player) = self.board[0][2] {
+                return Some(player);
+            }
         }
 
         None
@@ -114,7 +129,6 @@ impl Game {
 pub struct AppState {
     games: Arc<RwLock<HashMap<String, Game>>>,
     tx: broadcast::Sender<(String, Game)>,
-    websocket_clients: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<Message>>>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -131,183 +145,199 @@ pub struct JoinGameRequest {
     player: Option<Player>,
 }
 
-async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String> {
-    let game_id = Uuid::new_v4().to_string();
-    let mut games = state.games.write().await;
-    games.insert(game_id.clone(), Game::default());
-    Json(game_id)
+async fn join_game_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JoinGameRequest>,
+) -> Json<Result<Player, String>> {
+    info!("Received join game request: {:?}", req);
+    let mut games = state.games.write().unwrap();
+    let game = games
+        .entry(req.game_id.clone())
+        .or_insert_with(Game::default);
+
+    if game.players.len() >= 2 {
+        error!("Join game failed: Game {} is already full.", req.game_id);
+        return Json(Err("Game is already full.".to_string()));
+    }
+
+    if let Some(requested_player) = req.player {
+        if game.players.contains(&requested_player) {
+            error!(
+                "Join game failed: Player {:?} already taken in game {}.",
+                requested_player, req.game_id
+            );
+            return Json(Err(format!(
+                "Player {:?} is already taken. Choose a different symbol.",
+                requested_player
+            )));
+        }
+        game.players.push(requested_player);
+        info!(
+            "Player {:?} successfully joined game {} as the first player.",
+            requested_player, req.game_id
+        );
+
+        // Broadcast the game state update
+        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+            error!(
+                "Failed to broadcast updated game state after player joined: {:?}",
+                e
+            );
+        }
+
+        return Json(Ok(requested_player));
+    }
+
+    let assigned_player = if game.players.contains(&Player::X) {
+        Player::O
+    } else {
+        Player::X
+    };
+
+    game.players.push(assigned_player);
+    info!(
+        "Player {:?} automatically assigned to game {} as the second player.",
+        assigned_player, req.game_id
+    );
+
+    // Broadcast the game state update
+    if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+        error!(
+            "Failed to broadcast updated game state after player joined: {:?}",
+            e
+        );
+    }
+
+    Json(Ok(assigned_player))
 }
 
 async fn get_state_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<Game> {
-    let games = state.games.read().await;
-    if let Some(game) = games.get(&game_id) {
-        Json(game.clone())
-    } else {
-        Json(Game::default())
-    }
+    info!("Fetching state for game: {}", game_id);
+    let games = state.games.read().unwrap();
+    let game = games.get(&game_id).cloned().unwrap_or_default();
+    Json(game)
 }
 
-async fn join_game_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<JoinGameRequest>,
-) -> Json<Result<Player, String>> {
-    let mut games = state.games.write().await;
-    let game = games
-        .entry(req.game_id.clone())
-        .or_insert_with(Game::default);
-
-    if game.players.len() >= 2 {
-        return Json(Err("Game is full".to_string()));
-    }
-
-    let assigned_player = if let Some(requested_player) = req.player {
-        if game.players.contains(&requested_player) {
-            return Json(Err(format!(
-                "Player {:?} is already taken",
-                requested_player
-            )));
-        }
-        requested_player
-    } else {
-        if game.players.contains(&Player::X) {
-            Player::O
-        } else {
-            Player::X
-        }
-    };
-
-    game.players.push(assigned_player);
-    Json(Ok(assigned_player))
-}
-
-// Example: Use `tx` to broadcast game updates
 async fn make_move_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MoveRequest>,
 ) -> Json<Result<String, String>> {
-    let mut games = state.games.write().await;
-    if let Some(game) = games.get_mut(&req.game_id) {
-        let result = game.make_move(req.player, req.x, req.y);
-        if result.is_ok() {
-            let message = serde_json::to_string(&game).unwrap();
+    info!(
+        "Received move request: game_id={}, player={:?}, position=({}, {})",
+        req.game_id, req.player, req.x, req.y
+    );
 
-            // Use broadcast sender to notify subscribers
-            let _ = state.tx.send((req.game_id.clone(), game.clone()));
+    let mut games = state.games.write().unwrap();
+    let game = games.entry(req.game_id.clone()).or_default();
+    let result = game.make_move(req.player, req.x, req.y);
 
-            let websocket_clients = state.websocket_clients.lock().await;
-            if let Some(clients) = websocket_clients.get(&req.game_id) {
-                for client in clients {
-                    if let Err(e) = client.send(Message::Text(message.clone().into())).await {
-                        tracing::warn!("Failed to send WebSocket message: {}", e);
-                    }
-                }
-            }
+    if result.is_ok() {
+        info!(
+            "Move made: game_id={}, player={:?}, position=({}, {})",
+            req.game_id, req.player, req.x, req.y
+        );
+
+        // Broadcast the game state update
+        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+            error!("Failed to broadcast game update: {:?}", e);
         }
-        return Json(result.map(|_| "Move made".to_string()));
+    } else {
+        error!("Move failed: game_id={}, error={:?}", req.game_id, result);
     }
-    Json(Err("Game not found".to_string()))
+
+    Json(result.map(|_| "Move made".to_string()))
 }
 
 async fn reset_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<String> {
-    let mut games = state.games.write().await;
-    if let Some(game) = games.get_mut(&game_id) {
-        game.reset();
-        let message = serde_json::to_string(&game).unwrap();
-        let websocket_clients = state.websocket_clients.lock().await;
-        if let Some(clients) = websocket_clients.get(&game_id) {
-            for client in clients {
-                if let Err(e) = client.send(Message::Text(message.clone().into())).await {
-                    tracing::warn!("Failed to send WebSocket message: {}", e);
-                }
-            }
-        }
-    }
+    info!("Resetting game: {}", game_id);
+    let mut games = state.games.write().unwrap();
+    let game = games.entry(game_id.clone()).or_default();
+    game.reset();
+    let _ = state.tx.send((game_id.clone(), game.clone()));
     Json("Game reset".to_string())
 }
 
+#[axum::debug_handler]
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl axum::response::IntoResponse {
-    let game_id = params.get("game_id").cloned().unwrap_or_default();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, game_id))
+    info!("WebSocket upgrade request received");
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>, game_id: String) {
-    let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel(32);
+async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
+    info!("New WebSocket connection established");
+    let mut rx = state.tx.subscribe();
 
-    // Register the WebSocket client
-    {
-        let mut websocket_clients = state.websocket_clients.lock().await;
-        websocket_clients
-            .entry(game_id.clone()) // Clone game_id here
-            .or_default()
-            .push(tx);
-    }
+    while let Ok((game_id, game)) = rx.recv().await {
+        info!("Broadcasting update for game_id: {}", game_id);
 
-    // Clone game_id for each async block
-    let cleanup_game_id = game_id.clone();
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            while let Some(msg) = receiver.next().await {
-                match msg {
-                    Ok(Message::Close(_)) => {
-                        tracing::info!("Client disconnected from game: {}", cleanup_game_id);
-                        break;
-                    }
-                    Ok(_) => {
-                        // Handle other message types if needed
-                    }
-                    Err(e) => {
-                        tracing::warn!("WebSocket error: {}", e);
-                        break;
-                    }
-                }
+        let message = match serde_json::to_string(&(game_id.clone(), game)) {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!(
+                    "Failed to serialize game state: game_id={}, error={}",
+                    game_id, e
+                );
+                continue;
             }
+        };
 
-            // Remove client on disconnect
-            let mut websocket_clients = state.websocket_clients.lock().await;
-            if let Some(clients) = websocket_clients.get_mut(&cleanup_game_id) {
-                clients.retain(|client| !client.is_closed());
-            }
-            tracing::info!(
-                "Cleaned up disconnected client for game: {}",
-                cleanup_game_id
-            );
-        }
-    });
-
-    // Clone game_id for use in this loop
-    let send_game_id = game_id.clone();
-    while let Some(message) = rx.recv().await {
-        if sender.send(message).await.is_err() {
-            tracing::warn!(
-                "Failed to send message to client for game: {}",
-                send_game_id
-            );
+        if socket
+            .send(axum::extract::ws::Message::Text(message.into()))
+            .await
+            .is_err()
+        {
+            error!("WebSocket connection dropped for game_id: {}", game_id);
             break;
         }
     }
+
+    info!("WebSocket connection closed");
+}
+
+async fn cleanup_inactive_games(app_state: Arc<AppState>) {
+    let timeout = Duration::from_secs(1800);
+    loop {
+        {
+            let mut games = app_state.games.write().unwrap();
+            let before_cleanup = games.len();
+            games.retain(|_, game| game.last_activity.elapsed().unwrap_or(timeout) < timeout);
+            let after_cleanup = games.len();
+            if before_cleanup != after_cleanup {
+                info!(
+                    "Cleaned up inactive games. Remaining games: {}",
+                    after_cleanup
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String> {
+    let game_id = Uuid::new_v4().to_string();
+    info!("Creating new game with ID: {}", game_id);
+    let mut games = state.games.write().unwrap();
+    games.insert(game_id.clone(), Game::default());
+    Json(game_id)
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let (tx, _) = broadcast::channel(1000);
+    let (tx, _) = broadcast::channel(100); // Set the buffer size to 100 (or larger if needed)
 
     let app_state = Arc::new(AppState {
         games: Arc::new(RwLock::new(HashMap::new())),
-        tx: tx.clone(),
-        websocket_clients: Arc::new(Mutex::new(HashMap::new())),
+        tx: tx.clone(), // Ensure a reference to `tx` is retained here
     });
 
     let cors = CorsLayer::new()
@@ -318,12 +348,12 @@ async fn main() {
     let app = Router::new()
         .route("/create_game", post(create_game_handler))
         .route("/state", post(get_state_handler))
-        .route("/join_game", post(join_game_handler))
         .route("/make_move", post(make_move_handler))
         .route("/reset", post(reset_handler))
+        .route("/join_game", post(join_game_handler))
         .route("/ws", get(ws_handler))
         .layer(cors)
-        .with_state(app_state);
+        .with_state(Arc::clone(&app_state));
 
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
@@ -332,8 +362,9 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    info!("Server running at {}", addr);
+    info!("Server is running on {}", listener.local_addr().unwrap());
 
+    tokio::spawn(cleanup_inactive_games(Arc::clone(&app_state)));
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
