@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,11 +179,15 @@ async fn join_game_handler(
         );
 
         // Broadcast the game state update
-        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
-            error!(
-                "Failed to broadcast updated game state after player joined: {:?}",
-                e
-            );
+        if state.tx.receiver_count() > 0 {
+            if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+                error!(
+                    "Failed to broadcast updated game state after player joined: {:?}",
+                    e
+                );
+            }
+        } else {
+            warn!("No active subscribers for game ID: {}", req.game_id);
         }
 
         return Json(Ok(requested_player));
@@ -202,11 +206,15 @@ async fn join_game_handler(
     );
 
     // Broadcast the game state update
-    if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
-        error!(
-            "Failed to broadcast updated game state after player joined: {:?}",
-            e
-        );
+    if state.tx.receiver_count() > 0 {
+        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+            error!(
+                "Failed to broadcast updated game state after player joined: {:?}",
+                e
+            );
+        }
+    } else {
+        warn!("No active subscribers for game ID: {}", req.game_id);
     }
 
     Json(Ok(assigned_player))
@@ -242,8 +250,12 @@ async fn make_move_handler(
         );
 
         // Broadcast the game state update
-        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
-            error!("Failed to broadcast game update: {:?}", e);
+        if state.tx.receiver_count() > 0 {
+            if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+                error!("Failed to broadcast game update: {:?}", e);
+            }
+        } else {
+            warn!("No active subscribers for game ID: {}", req.game_id);
         }
     } else {
         error!("Move failed: game_id={}, error={:?}", req.game_id, result);
@@ -260,10 +272,17 @@ async fn reset_handler(
     let mut games = state.games.write().unwrap();
     let game = games.entry(game_id.clone()).or_default();
     game.reset();
-    let _ = state.tx.send((game_id.clone(), game.clone()));
+
+    if state.tx.receiver_count() > 0 {
+        if let Err(e) = state.tx.send((game_id.clone(), game.clone())) {
+            error!("Failed to broadcast reset game state: {:?}", e);
+        }
+    } else {
+        warn!("No active subscribers for game ID: {}", game_id);
+    }
+
     Json("Game reset".to_string())
 }
-
 #[axum::debug_handler]
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -281,26 +300,33 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppS
         tokio::select! {
             // Handle game updates
             update = rx.recv() => {
-                if let Ok((game_id, game)) = update {
-                    let message = match serde_json::to_string(&(game_id, game)) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            error!("Failed to serialize game state: {}", e);
-                            continue;
+                match update {
+                    Ok((game_id, game)) => {
+                        let game_id_for_error = game_id.clone(); // Clone game_id for later use
+                        match serde_json::to_string(&(game_id, game)) {
+                            Ok(message) => {
+                                if let Err(e) = socket.send(axum::extract::ws::Message::Text(message.into())).await {
+                                    error!("WebSocket send error: {}", e);
+                                    break; // Exit loop on send failure
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize game state for game ID {}: {}", game_id_for_error, e);
+                                continue; // Skip this message and continue listening
+                            }
                         }
-                    };
-
-                    if socket.send(axum::extract::ws::Message::Text(message.into())).await.is_err() {
-                        error!("WebSocket connection dropped");
-                        break;
+                    }
+                    Err(e) => {
+                        error!("Broadcast channel receive error: {}", e);
+                        break; // Exit loop on channel error
                     }
                 }
             }
             // Send periodic keep-alive pings
             _ = interval.tick() => {
                 if socket.send(axum::extract::ws::Message::Ping(vec![].into())).await.is_err() {
-                    error!("Failed to send ping, closing connection");
-                    break;
+                    error!("Failed to send ping, closing WebSocket");
+                    break; // Exit loop if ping fails
                 }
             }
         }
