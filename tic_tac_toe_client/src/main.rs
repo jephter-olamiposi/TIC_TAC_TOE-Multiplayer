@@ -198,7 +198,6 @@ impl GameService {
 
                     while let Ok(msg) = socket.read() {
                         if let Message::Text(text) = msg {
-                            debug!("WebSocket message received: {}", text);
                             if let Ok((received_game_id, received_game)) =
                                 serde_json::from_str::<(String, Game)>(&text)
                             {
@@ -213,6 +212,7 @@ impl GameService {
                     }
                 } else {
                     retries += 1;
+
                     error!(
                         "WebSocket connection failed for game ID: {}. Retry {}/{}",
                         game_id, retries, max_retries
@@ -265,12 +265,13 @@ impl eframe::App for GameApp {
                     ui.set_width(400.0);
                     ui.set_height(500.0);
 
+                    // Create Game Section
                     if ui.button("Create Game").clicked() {
                         match self.game_service.create_game() {
                             Ok(game_id) => {
                                 self.game_id = game_id;
                                 self.input_game_id = self.game_id.clone();
-                                info!("Game created with ID: {}", self.game_id);
+                                info!("New game created with ID: {}", self.game_id);
                             }
                             Err(e) => {
                                 self.error_message = Some(format!("Error creating game: {}", e));
@@ -278,21 +279,91 @@ impl eframe::App for GameApp {
                         }
                     }
 
+                    // Join Game Section
                     ui.label("Game ID:");
                     ui.text_edit_singleline(&mut self.input_game_id);
                     if ui
                         .add_enabled(!self.loading, egui::Button::new("Join Game"))
                         .clicked()
                     {
-                        self.join_game(ctx);
+                        if !self.input_game_id.is_empty() {
+                            info!(
+                                "Join game button clicked with game ID: {}",
+                                self.input_game_id
+                            );
+                            self.join_game(ctx);
+                        }
                     }
 
+                    ui.add_space(20.0);
+
+                    // Player Selection Section
+                    if self.player.is_none() {
+                        ui.label("Select Your Player:");
+                        if ui.button("Play as X").clicked() {
+                            match self.game_service.join_game(&self.game_id, Some(Player::X)) {
+                                Ok(player) => {
+                                    if player == Player::X {
+                                        self.player = Some(Player::X);
+                                        info!("Assigned Player X to game {}", self.game_id);
+                                    } else {
+                                        self.error_message =
+                                            Some("Failed to assign Player X.".to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Error: {}", e));
+                                }
+                            }
+                        }
+
+                        if ui.button("Play as O").clicked() {
+                            match self.game_service.join_game(&self.game_id, Some(Player::O)) {
+                                Ok(player) => {
+                                    if player == Player::O {
+                                        self.player = Some(Player::O);
+                                        info!("Assigned Player O to game {}", self.game_id);
+                                    } else {
+                                        self.error_message =
+                                            Some("Failed to assign Player O.".to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Error: {}", e));
+                                }
+                            }
+                        }
+                    }
+
+                    ui.add_space(20.0);
+
+                    // Error Message Section
                     if let Some(error) = &self.error_message {
                         ui.colored_label(egui::Color32::RED, error);
+                        ui.add_space(10.0);
                     }
 
+                    // Game Board and Status
                     if self.joined && self.player.is_some() {
                         self.render_board(ui);
+                        ui.add_space(20.0);
+                        self.display_game_status(ui);
+
+                        if self.game_service.get_game().lock().unwrap().game_over {
+                            if ui
+                                .add_enabled(
+                                    !self.loading,
+                                    egui::Button::new(
+                                        egui::RichText::new("Reset Game")
+                                            .size(30.0)
+                                            .color(egui::Color32::from_rgb(240, 148, 0)),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.reset_game();
+                            }
+                        }
                     }
                 });
             });
@@ -308,20 +379,29 @@ impl GameApp {
         ui.vertical(|ui| {
             for row in 0..3 {
                 ui.horizontal(|ui| {
+                    ui.add_space(40.0);
                     for col in 0..3 {
                         let cell = game.lock().unwrap().board[row][col];
                         let button = ui.add_enabled(
-                            !game.lock().unwrap().game_over,
+                            !game.lock().unwrap().game_over
+                                && self.player.is_some()
+                                && self.player.unwrap() == game.lock().unwrap().current_turn,
                             egui::Button::new(match cell {
-                                Some(Player::X) => "X",
-                                Some(Player::O) => "O",
-                                None => " ",
+                                Some(Player::X) => egui::RichText::new("X")
+                                    .size(50.0)
+                                    .color(egui::Color32::from_rgb(255, 99, 71)),
+                                Some(Player::O) => egui::RichText::new("O")
+                                    .size(50.0)
+                                    .color(egui::Color32::from_rgb(34, 139, 34)),
+                                None => egui::RichText::new(" ")
+                                    .size(50.0)
+                                    .color(egui::Color32::from_rgb(180, 180, 180)),
                             })
                             .min_size(egui::vec2(button_size, button_size)),
                         );
 
                         if button.clicked() && cell.is_none() {
-                            self.make_move(row, col);
+                            self.make_move(self.player.unwrap(), row, col);
                         }
                     }
                 });
@@ -329,27 +409,86 @@ impl GameApp {
         });
     }
 
-    fn join_game(&mut self, ctx: &egui::Context) {
-        if let Ok(player) = self.game_service.join_game(&self.input_game_id, None) {
-            self.player = Some(player);
-            self.joined = true;
-            self.game_service
-                .start_websocket_listener(self.input_game_id.clone(), Arc::new(ctx.clone()));
+    fn display_game_status(&self, ui: &mut egui::Ui) {
+        let game = self.game_service.get_game();
+        let game = game.lock().unwrap();
+
+        if game.game_over {
+            let status_message = if game.draw {
+                "It's a draw!".to_string()
+            } else {
+                format!("{:?} wins!", game.current_turn)
+            };
+            ui.label(
+                egui::RichText::new(status_message)
+                    .size(30.0)
+                    .color(egui::Color32::from_rgb(255, 0, 0)),
+            );
+        } else {
+            let turn_message = format!("{:?}'s turn", game.current_turn);
+            ui.label(
+                egui::RichText::new(turn_message)
+                    .size(30.0)
+                    .color(egui::Color32::from_rgb(0, 255, 0)),
+            );
         }
     }
 
-    fn make_move(&mut self, row: usize, col: usize) {
-        if let Some(player) = self.player {
-            if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
-                self.error_message = Some(format!("Error making move: {}", e));
+    fn join_game(&mut self, ctx: &egui::Context) {
+        self.loading = true;
+        self.error_message = None;
+        self.game_id = self.input_game_id.clone();
+
+        info!("Attempting to join game with ID: {}", self.game_id);
+
+        match self.game_service.join_game(&self.game_id, None) {
+            Ok(player) => {
+                self.player = Some(player);
+                self.joined = true;
+                self.game_service.fetch_game_state(&self.game_id).unwrap();
+
+                // Wrap the context in an Arc before passing it
+                self.game_service
+                    .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
+                info!("Successfully joined game with ID: {}", self.game_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to join game: {}", e));
             }
         }
+
+        self.loading = false;
+    }
+
+    fn make_move(&mut self, player: Player, row: usize, col: usize) {
+        if self.loading {
+            return;
+        }
+
+        info!("Player {:?} making move at ({}, {})", player, row, col);
+
+        if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
+            self.error_message = Some(format!("Error making move: {}", e));
+        }
+    }
+
+    fn reset_game(&mut self) {
+        self.loading = true;
+        self.error_message = None;
+
+        info!("Resetting game with ID: {}", self.game_id);
+
+        if let Err(e) = self.game_service.reset_game(&self.game_id) {
+            self.error_message = Some(format!("Error resetting game: {}", e));
+        }
+
+        self.loading = false;
     }
 }
 
 fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
-        "Tic-Tac-Toe Multiplayer",
+        "Tic-Tac-Toe (Multiplayer)",
         eframe::NativeOptions::default(),
         Box::new(|_cc| Ok(Box::new(GameApp::default()))),
     )
