@@ -251,23 +251,31 @@ async fn ws_handler(
 
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection established");
+
+    // Subscribe to the broadcast channel
     let mut rx = state.tx.subscribe();
 
+    // Loop to handle incoming messages from the broadcast channel
     while let Ok((game_id, game)) = rx.recv().await {
         info!("Broadcasting update for game_id: {}", game_id);
 
-        // Clone `game_id` before using it in serde_json::to_string
+        // Serialize the game state and send it to the WebSocket client
+        let message = match serde_json::to_string(&(game_id.clone(), game)) {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Failed to serialize game state: {}", e);
+                continue; // Skip this iteration and proceed
+            }
+        };
+
+        // Attempt to send the message
         if socket
-            .send(axum::extract::ws::Message::Text(
-                serde_json::to_string(&(game_id.clone(), game))
-                    .unwrap()
-                    .into(),
-            ))
+            .send(axum::extract::ws::Message::Text(message.into()))
             .await
             .is_err()
         {
             error!("WebSocket connection dropped for game_id: {}", game_id);
-            break;
+            break; // Exit the loop if the connection is lost
         }
     }
 

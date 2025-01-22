@@ -192,32 +192,37 @@ impl GameService {
             let backoff_duration = Duration::from_secs(2);
 
             while retries < max_retries {
-                if let Ok((mut socket, _)) = connect(&server_url) {
-                    info!("WebSocket connection established for game ID: {}", game_id);
-                    retries = 0;
+                match connect(&server_url) {
+                    Ok((mut socket, _)) => {
+                        info!("WebSocket connection established for game ID: {}", game_id);
+                        retries = 0;
 
-                    while let Ok(msg) = socket.read() {
-                        if let Message::Text(text) = msg {
-                            if let Ok((received_game_id, received_game)) =
-                                serde_json::from_str::<(String, Game)>(&text)
-                            {
-                                if received_game_id == game_id {
-                                    let mut game = game_clone.lock().unwrap();
-                                    *game = received_game;
-                                    ctx.request_repaint();
-                                    info!("Game state updated for game ID: {}", game_id);
+                        while let Ok(msg) = socket.read() {
+                            if let Message::Text(text) = msg {
+                                match serde_json::from_str::<(String, Game)>(&text) {
+                                    Ok((received_game_id, received_game))
+                                        if received_game_id == game_id =>
+                                    {
+                                        let mut game = game_clone.lock().unwrap();
+                                        *game = received_game;
+                                        ctx.request_repaint();
+                                        info!("Game state updated for game ID: {}", game_id);
+                                    }
+                                    _ => {
+                                        error!("Invalid WebSocket message: {}", text);
+                                    }
                                 }
                             }
                         }
                     }
-                } else {
-                    retries += 1;
-
-                    error!(
-                        "WebSocket connection failed for game ID: {}. Retry {}/{}",
-                        game_id, retries, max_retries
-                    );
-                    thread::sleep(backoff_duration * retries as u32);
+                    Err(e) => {
+                        retries += 1;
+                        error!(
+                            "WebSocket connection failed for game ID: {}. Retry {}/{}. Error: {}",
+                            game_id, retries, max_retries, e
+                        );
+                        thread::sleep(backoff_duration * retries as u32);
+                    }
                 }
             }
 
@@ -445,12 +450,19 @@ impl GameApp {
             Ok(player) => {
                 self.player = Some(player);
                 self.joined = true;
-                self.game_service.fetch_game_state(&self.game_id).unwrap();
 
-                // Wrap the context in an Arc before passing it
-                self.game_service
-                    .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
-                info!("Successfully joined game with ID: {}", self.game_id);
+                match self.game_service.fetch_game_state(&self.game_id) {
+                    Ok(_) => {
+                        // Wrap the context in an Arc before passing it
+                        self.game_service
+                            .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
+                        info!("Successfully joined game with ID: {}", self.game_id);
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to fetch game state: {}", e));
+                        self.joined = false; // Reset `joined` if fetch fails
+                    }
+                }
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to join game: {}", e));
