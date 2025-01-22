@@ -143,6 +143,11 @@ impl GameService {
         row: usize,
         col: usize,
     ) -> Result<(), String> {
+        info!(
+            "Player {:?} making move at ({}, {}) in game ID: {}",
+            player, row, col, game_id
+        );
+
         let response = self
             .client
             .post(format!("{}/make_move", self.server_url))
@@ -154,13 +159,20 @@ impl GameService {
             }))
             .send();
 
-        response.map_err(|e| e.to_string()).and_then(|resp| {
-            if resp.status().is_success() {
-                self.fetch_game_state(game_id).map(|_| ())
-            } else {
-                Err(format!("Server error: {}", resp.status()))
-            }
-        })
+        response
+            .map_err(|e| {
+                error!("Error sending move to server: {}", e);
+                e.to_string()
+            })
+            .and_then(|resp| {
+                if resp.status().is_success() {
+                    info!("Move successful on server, fetching updated game state...");
+                    self.fetch_game_state(game_id).map(|_| ())
+                } else {
+                    error!("Server error while making move: {}", resp.status());
+                    Err(format!("Server error: {}", resp.status()))
+                }
+            })
     }
 
     pub fn reset_game(&self, game_id: &str) -> Result<(), String> {

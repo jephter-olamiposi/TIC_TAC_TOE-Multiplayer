@@ -160,7 +160,7 @@ async fn join_game_handler(
         return Json(Err("Game is already full.".to_string()));
     }
 
-    if let Some(requested_player) = req.player {
+    let assigned_player = if let Some(requested_player) = req.player {
         if game.players.contains(&requested_player) {
             error!(
                 "Join game failed: Player {:?} already taken in game {}.",
@@ -171,28 +171,31 @@ async fn join_game_handler(
                 requested_player
             )));
         }
-        game.players.push(requested_player);
-        info!(
-            "Player {:?} successfully joined game {} as the first player.",
-            requested_player, req.game_id
-        );
-        return Json(Ok(requested_player));
-    }
-
-    let assigned_player = if game.players.contains(&Player::X) {
-        Player::O
+        requested_player
     } else {
-        Player::X
+        if game.players.contains(&Player::X) {
+            Player::O
+        } else {
+            Player::X
+        }
     };
 
     game.players.push(assigned_player);
     info!(
-        "Player {:?} automatically assigned to game {} as the second player.",
+        "Player {:?} successfully joined game {}.",
         assigned_player, req.game_id
     );
+
+    // Broadcast updated state after player joins
+    if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+        error!(
+            "Failed to broadcast updated game state after player joined: {}",
+            e
+        );
+    }
+
     Json(Ok(assigned_player))
 }
-
 async fn get_state_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
@@ -211,6 +214,7 @@ async fn make_move_handler(
         "Received move request: game_id={}, player={:?}, position=({}, {})",
         req.game_id, req.player, req.x, req.y
     );
+
     let mut games = state.games.write().unwrap();
     let game = games.entry(req.game_id.clone()).or_default();
     let result = game.make_move(req.player, req.x, req.y);
@@ -220,7 +224,9 @@ async fn make_move_handler(
             "Move made: game_id={}, player={:?}, position=({}, {})",
             req.game_id, req.player, req.x, req.y
         );
-        let _ = state.tx.send((req.game_id.clone(), game.clone()));
+        if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
+            error!("Failed to broadcast game update: {}", e);
+        }
     } else {
         error!("Move failed: game_id={}, error={:?}", req.game_id, result);
     }
@@ -251,31 +257,29 @@ async fn ws_handler(
 
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection established");
-
-    // Subscribe to the broadcast channel
     let mut rx = state.tx.subscribe();
 
-    // Loop to handle incoming messages from the broadcast channel
     while let Ok((game_id, game)) = rx.recv().await {
         info!("Broadcasting update for game_id: {}", game_id);
 
-        // Serialize the game state and send it to the WebSocket client
         let message = match serde_json::to_string(&(game_id.clone(), game)) {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Failed to serialize game state: {}", e);
-                continue; // Skip this iteration and proceed
+                error!(
+                    "Failed to serialize game state: game_id={}, error={}",
+                    game_id, e
+                );
+                continue;
             }
         };
 
-        // Attempt to send the message
         if socket
             .send(axum::extract::ws::Message::Text(message.into()))
             .await
             .is_err()
         {
             error!("WebSocket connection dropped for game_id: {}", game_id);
-            break; // Exit the loop if the connection is lost
+            break;
         }
     }
 
