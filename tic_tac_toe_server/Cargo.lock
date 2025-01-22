@@ -744,7 +744,6 @@ name = "tic_tac_toe_server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "http",
  "serde",
  "serde_json",
  "tokio",

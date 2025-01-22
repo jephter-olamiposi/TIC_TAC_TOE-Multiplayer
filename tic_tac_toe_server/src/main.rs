@@ -24,19 +24,19 @@ pub enum Player {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
-    pub board: [[Option<Player>; 3]; 3], // Represents the game board (3x3 grid) with optional Player symbols
-    pub current_turn: Player,            // Tracks whose turn it is (Player::X or Player::O)
-    pub game_over: bool,                 // Indicates if the game is over
-    pub draw: bool,                      // Indicates if the game ended in a draw
-    pub last_activity: SystemTime,       // Timestamp of the last game activity
-    pub players: Vec<Player>,            // List of players who joined the game
+    pub board: [[Option<Player>; 3]; 3],
+    pub current_turn: Player,
+    pub game_over: bool,
+    pub draw: bool,
+    pub last_activity: SystemTime,
+    pub players: Vec<Player>,
 }
 
 impl Default for Game {
     fn default() -> Self {
         Game {
             board: [[None; 3]; 3],
-            current_turn: Player::X, // Default starting turn is Player::X
+            current_turn: Player::X,
             game_over: false,
             draw: false,
             last_activity: SystemTime::now(),
@@ -46,13 +46,11 @@ impl Default for Game {
 }
 
 impl Game {
-    // Resets the game to its default state
     fn reset(&mut self) {
         *self = Game::default();
         debug!("Game reset to default state.");
     }
 
-    // Handles making a move on the board
     fn make_move(&mut self, player: Player, x: usize, y: usize) -> Result<(), String> {
         if self.game_over {
             debug!("Move rejected: Game is already over.");
@@ -92,10 +90,8 @@ impl Game {
         Ok(())
     }
 
-    // Checks if there is a winner on the board
     fn check_winner(&self) -> Option<Player> {
         for i in 0..3 {
-            // Check rows and columns for a winner
             if self.board[i][0] == self.board[i][1] && self.board[i][1] == self.board[i][2] {
                 if let Some(player) = self.board[i][0] {
                     return Some(player);
@@ -108,7 +104,6 @@ impl Game {
             }
         }
 
-        // Check diagonals for a winner
         if self.board[0][0] == self.board[1][1] && self.board[1][1] == self.board[2][2] {
             if let Some(player) = self.board[0][0] {
                 return Some(player);
@@ -123,7 +118,6 @@ impl Game {
         None
     }
 
-    // Checks if the board is full (no more moves can be made)
     fn is_full(&self) -> bool {
         self.board
             .iter()
@@ -133,46 +127,41 @@ impl Game {
 
 #[derive(Clone)]
 pub struct AppState {
-    games: Arc<RwLock<HashMap<String, Game>>>, // Shared state of all games
-    tx: broadcast::Sender<(String, Game)>,     // Broadcast channel for game updates
+    games: Arc<RwLock<HashMap<String, Game>>>,
+    tx: broadcast::Sender<(String, Game)>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct MoveRequest {
-    game_id: String, // ID of the game where the move is made
-    player: Player,  // Player making the move
-    x: usize,        // Row of the move
-    y: usize,        // Column of the move
+    game_id: String,
+    player: Player,
+    x: usize,
+    y: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JoinGameRequest {
-    game_id: String,        // ID of the game to join
-    player: Option<Player>, // Optional symbol choice (X or O)
+    game_id: String,
+    player: Option<Player>,
 }
 
-// Handler to join a game
 async fn join_game_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGameRequest>,
 ) -> Json<Result<Player, String>> {
+    info!("Received join game request: {:?}", req);
     let mut games = state.games.write().unwrap();
-
-    // Retrieve or initialize the game
     let game = games
         .entry(req.game_id.clone())
         .or_insert_with(Game::default);
 
-    // Check if the game is full
     if game.players.len() >= 2 {
         error!("Join game failed: Game {} is already full.", req.game_id);
         return Json(Err("Game is already full.".to_string()));
     }
 
-    // Handle explicit player symbol requests
     if let Some(requested_player) = req.player {
         if game.players.contains(&requested_player) {
-            // Requested player is already taken
             error!(
                 "Join game failed: Player {:?} already taken in game {}.",
                 requested_player, req.game_id
@@ -182,8 +171,6 @@ async fn join_game_handler(
                 requested_player
             )));
         }
-
-        // Assign the requested player
         game.players.push(requested_player);
         info!(
             "Player {:?} successfully joined game {} as the first player.",
@@ -192,7 +179,6 @@ async fn join_game_handler(
         return Json(Ok(requested_player));
     }
 
-    // Automatically assign the opposite symbol for the second player
     let assigned_player = if game.players.contains(&Player::X) {
         Player::O
     } else {
@@ -207,83 +193,89 @@ async fn join_game_handler(
     Json(Ok(assigned_player))
 }
 
-// Handler to fetch the state of a game
 async fn get_state_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<Game> {
+    info!("Fetching state for game: {}", game_id);
     let games = state.games.read().unwrap();
     let game = games.get(&game_id).cloned().unwrap_or_default();
-    debug!("State fetched for game {}: {:?}", game_id, game);
     Json(game)
 }
 
-// Handler to make a move in a game
 async fn make_move_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MoveRequest>,
 ) -> Json<Result<String, String>> {
+    info!(
+        "Received move request: game_id={}, player={:?}, position=({}, {})",
+        req.game_id, req.player, req.x, req.y
+    );
     let mut games = state.games.write().unwrap();
     let game = games.entry(req.game_id.clone()).or_default();
     let result = game.make_move(req.player, req.x, req.y);
 
     if result.is_ok() {
-        let _ = state.tx.send((req.game_id.clone(), game.clone()));
         info!(
-            "Move made in game {}: Player {:?} to ({}, {}).",
+            "Move made: game_id={}, player={:?}, position=({}, {})",
             req.game_id, req.player, req.x, req.y
         );
+        let _ = state.tx.send((req.game_id.clone(), game.clone()));
     } else {
-        error!("Move failed in game {}: {:?}", req.game_id, result);
+        error!("Move failed: game_id={}, error={:?}", req.game_id, result);
     }
 
     Json(result.map(|_| "Move made".to_string()))
 }
 
-// Handler to reset a game
 async fn reset_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<String> {
+    info!("Resetting game: {}", game_id);
     let mut games = state.games.write().unwrap();
     let game = games.entry(game_id.clone()).or_default();
     game.reset();
     let _ = state.tx.send((game_id.clone(), game.clone()));
-    info!("Game {} has been reset.", game_id);
     Json("Game reset".to_string())
 }
 
-// WebSocket handler to manage real-time updates
 #[axum::debug_handler]
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
+    info!("WebSocket upgrade request received");
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-// Handles WebSocket connections for broadcasting game updates
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
+    info!("New WebSocket connection established");
     let mut rx = state.tx.subscribe();
 
     while let Ok((game_id, game)) = rx.recv().await {
         info!("Broadcasting update for game_id: {}", game_id);
+
+        // Clone `game_id` before using it in serde_json::to_string
         if socket
             .send(axum::extract::ws::Message::Text(
-                serde_json::to_string(&(game_id, game)).unwrap().into(),
+                serde_json::to_string(&(game_id.clone(), game))
+                    .unwrap()
+                    .into(),
             ))
             .await
             .is_err()
         {
-            error!("WebSocket connection dropped.");
+            error!("WebSocket connection dropped for game_id: {}", game_id);
             break;
         }
     }
+
+    info!("WebSocket connection closed");
 }
 
-// Periodically cleans up inactive games
 async fn cleanup_inactive_games(app_state: Arc<AppState>) {
-    let timeout = Duration::from_secs(1800); // 30 minutes
+    let timeout = Duration::from_secs(1800);
     loop {
         {
             let mut games = app_state.games.write().unwrap();
@@ -301,12 +293,11 @@ async fn cleanup_inactive_games(app_state: Arc<AppState>) {
     }
 }
 
-// Handler to create a new game
 async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String> {
     let game_id = Uuid::new_v4().to_string();
+    info!("Creating new game with ID: {}", game_id);
     let mut games = state.games.write().unwrap();
     games.insert(game_id.clone(), Game::default());
-    info!("New game created with ID: {}", game_id);
     Json(game_id)
 }
 
@@ -335,7 +326,6 @@ async fn main() {
         .layer(cors)
         .with_state(Arc::clone(&app_state));
 
-    // Use the PORT environment variable provided by Render
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
@@ -346,5 +336,7 @@ async fn main() {
     info!("Server is running on {}", listener.local_addr().unwrap());
 
     tokio::spawn(cleanup_inactive_games(Arc::clone(&app_state)));
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service())
+        .await
+        .unwrap();
 }
