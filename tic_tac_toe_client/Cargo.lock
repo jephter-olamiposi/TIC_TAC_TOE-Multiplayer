@@ -3252,6 +3252,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures-util",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

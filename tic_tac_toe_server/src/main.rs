@@ -271,35 +271,56 @@ async fn ws_handler(
     info!("WebSocket upgrade request received");
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
-
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection established");
     let mut rx = state.tx.subscribe();
+    let ping_interval = tokio::time::interval(Duration::from_secs(30)); // Ping every 30 seconds
+    tokio::pin!(ping_interval);
 
-    while let Ok((game_id, game)) = rx.recv().await {
-        info!("Broadcasting update for game_id: {}", game_id);
+    loop {
+        tokio::select! {
+            // Send broadcast updates to WebSocket clients
+            msg = rx.recv() => {
+                match msg {
+                    Ok((game_id, game)) => {
+                        let message = match serde_json::to_string(&(game_id, game)) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                error!("Failed to serialize game state: {}", e);
+                                continue;
+                            }
+                        };
 
-        let message = match serde_json::to_string(&(game_id.clone(), game)) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!(
-                    "Failed to serialize game state: game_id={}, error={}",
-                    game_id, e
-                );
-                continue;
+                        if socket.send(axum::extract::ws::Message::Text(message.into())).await.is_err() {
+                            error!("WebSocket connection dropped.");
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        error!("Failed to receive message from broadcast channel.");
+                        break;
+                    }
+                }
             }
-        };
+            // Respond to ping messages to keep the connection alive
+            Some(Ok(axum::extract::ws::Message::Ping(ping))) = socket.recv() => {
+                if socket.send(axum::extract::ws::Message::Pong(ping)).await.is_err() {
+                    error!("Failed to send Pong.");
+                    break;
+                }
+            }
+            // Send periodic pings to the client
+            _ = ping_interval.tick() => {
+               if socket.send(axum::extract::ws::Message::Ping(vec![].into())).await.is_err() {
 
-        if socket
-            .send(axum::extract::ws::Message::Text(message.into()))
-            .await
-            .is_err()
-        {
-            error!("WebSocket connection dropped for game_id: {}", game_id);
-            break;
+                    error!("Failed to send Ping.");
+                    break;
+                }
+            }
+            // Handle connection closure
+            else => break,
         }
     }
-
     info!("WebSocket connection closed");
 }
 

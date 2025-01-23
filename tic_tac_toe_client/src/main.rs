@@ -1,4 +1,5 @@
 use eframe::egui;
+use rand::Rng;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -190,8 +191,8 @@ impl GameService {
 
         thread::spawn(move || {
             let mut retries = 0;
-            let max_retries = 5;
-            let backoff_duration = Duration::from_secs(2);
+            let max_retries = 5; // Maximum retries
+            let base_backoff_duration = Duration::from_secs(2); // Base backoff time
 
             loop {
                 match connect(&websocket_url) {
@@ -255,12 +256,15 @@ impl GameService {
                             break;
                         }
 
-                        // Wait before retrying
-                        let capped_backoff = std::cmp::min(
-                            backoff_duration * retries as u32,
-                            Duration::from_secs(30),
+                        // Add jitter to the backoff duration
+                        let jitter: u64 = rand::thread_rng().gen_range(0..1000); // Jitter in milliseconds
+                        let backoff = std::cmp::min(
+                            base_backoff_duration * retries as u32 + Duration::from_millis(jitter),
+                            Duration::from_secs(30), // Cap the backoff duration at 30 seconds
                         );
-                        thread::sleep(capped_backoff);
+
+                        info!("Retrying WebSocket connection in {:?}", backoff);
+                        thread::sleep(backoff);
                     }
                 }
             }
