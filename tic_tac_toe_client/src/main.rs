@@ -114,29 +114,6 @@ impl GameService {
                 }
             })
     }
-
-    pub fn fetch_game_state(&self, game_id: &str) -> Result<(), String> {
-        let response = self
-            .client
-            .post(format!("{}/state", self.server_url))
-            .json(&game_id)
-            .send();
-
-        response.map_err(|e| e.to_string()).and_then(|resp| {
-            if resp.status().is_success() {
-                let new_game = resp.json::<Game>().map_err(|e| e.to_string())?;
-                let mut game = self.game.lock().unwrap();
-                *game = new_game;
-                info!("Fetched new game state for game ID: {}", game_id);
-                Ok(())
-            } else if resp.status() == 404 {
-                Err("Game not found. It may have expired.".to_string())
-            } else {
-                Err(format!("Server error: {}", resp.status()))
-            }
-        })
-    }
-
     pub fn make_move(
         &self,
         game_id: &str,
@@ -158,6 +135,28 @@ impl GameService {
         response.map_err(|e| e.to_string()).and_then(|resp| {
             if resp.status().is_success() {
                 self.fetch_game_state(game_id).map(|_| ())
+            } else {
+                Err(format!("Server error: {}", resp.status()))
+            }
+        })
+    }
+
+    pub fn fetch_game_state(&self, game_id: &str) -> Result<(), String> {
+        let response = self
+            .client
+            .post(format!("{}/state", self.server_url))
+            .json(&game_id)
+            .send();
+
+        response.map_err(|e| e.to_string()).and_then(|resp| {
+            if resp.status().is_success() {
+                let new_game = resp.json::<Game>().map_err(|e| e.to_string())?;
+                let mut game = self.game.lock().unwrap();
+                *game = new_game;
+                info!("Fetched new game state for game ID: {}", game_id);
+                Ok(())
+            } else if resp.status() == 404 {
+                Err("Game not found. It may have expired.".to_string())
             } else {
                 Err(format!("Server error: {}", resp.status()))
             }
@@ -475,32 +474,6 @@ impl GameApp {
         }
     }
 
-    fn join_game(&mut self, ctx: &egui::Context) {
-        self.loading = true;
-        self.error_message = None;
-        self.game_id = self.input_game_id.clone();
-
-        info!("Attempting to join game with ID: {}", self.game_id);
-
-        match self.game_service.join_game(&self.game_id, None) {
-            Ok(player) => {
-                self.player = Some(player);
-                self.joined = true;
-                self.game_service.fetch_game_state(&self.game_id).unwrap();
-
-                // Wrap the context in an Arc before passing it
-                self.game_service
-                    .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
-                info!("Successfully joined game with ID: {}", self.game_id);
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to join game: {}", e));
-            }
-        }
-
-        self.loading = false;
-    }
-
     fn make_move(&mut self, player: Player, row: usize, col: usize) {
         if self.loading {
             return;
@@ -511,6 +484,39 @@ impl GameApp {
         if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
             self.error_message = Some(format!("Error making move: {}", e));
         }
+    }
+
+    fn join_game(&mut self, ctx: &egui::Context) {
+        self.loading = true; // Set the loading state
+        self.error_message = None; // Clear any previous errors
+        self.game_id = self.input_game_id.clone(); // Copy the input game ID to the current game ID
+
+        info!("Attempting to join game with ID: {}", self.game_id);
+
+        // Attempt to join the game using the GameService
+        match self.game_service.join_game(&self.game_id, None) {
+            Ok(player) => {
+                // Set the assigned player and update the joined state
+                self.player = Some(player);
+                self.joined = true;
+
+                // Attempt to fetch the latest game state after joining
+                if let Err(e) = self.game_service.fetch_game_state(&self.game_id) {
+                    self.error_message = Some(format!("Failed to fetch game state: {}", e));
+                } else {
+                    info!("Successfully joined game with ID: {}", self.game_id);
+
+                    self.game_service
+                        .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
+                }
+            }
+            Err(e) => {
+                // If joining the game fails, set the error message
+                self.error_message = Some(format!("Failed to join game: {}", e));
+            }
+        }
+
+        self.loading = false; // Reset the loading state
     }
 
     fn reset_game(&mut self) {
