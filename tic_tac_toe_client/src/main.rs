@@ -386,31 +386,43 @@ impl eframe::App for GameApp {
                         ui.colored_label(egui::Color32::RED, error);
                         ui.add_space(10.0);
                     }
-                    if self.joined {
-                        if ui.button("Debug: Broadcast State").clicked() {
-                            self.broadcast_game_state();
-                        }
+
+                    if ui.button("Fetch Game State").clicked() {
+                        self.fetch_game_state(ctx);
                     }
 
-                    // Game Board and Status
+                    // Waiting for Another Player
                     if self.joined && self.player.is_some() {
-                        self.render_board(ui);
-                        ui.add_space(20.0);
-                        self.display_game_status(ui);
+                        let game = self.game_service.get_game();
+                        let game = game.lock().unwrap();
 
-                        if self.game_service.get_game().lock().unwrap().game_over {
-                            if ui
-                                .add_enabled(
-                                    !self.loading,
-                                    egui::Button::new(
-                                        egui::RichText::new("Reset Game")
-                                            .size(30.0)
-                                            .color(egui::Color32::from_rgb(240, 148, 0)),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                self.reset_game();
+                        if game.players.len() < 2 {
+                            // Display a waiting message if the second player hasn't joined yet
+                            ui.label(
+                                egui::RichText::new("Waiting for another player to join...")
+                                    .size(20.0)
+                                    .color(egui::Color32::YELLOW),
+                            );
+                        } else {
+                            // Game Board and Status
+                            self.render_board(ui);
+                            ui.add_space(20.0);
+                            self.display_game_status(ui);
+
+                            if game.game_over {
+                                if ui
+                                    .add_enabled(
+                                        !self.loading,
+                                        egui::Button::new(
+                                            egui::RichText::new("Reset Game")
+                                                .size(30.0)
+                                                .color(egui::Color32::from_rgb(240, 148, 0)),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.reset_game();
+                                }
                             }
                         }
                     }
@@ -457,35 +469,16 @@ impl GameApp {
             }
         });
     }
-    fn broadcast_game_state(&mut self) {
-        if self.loading {
-            return;
-        }
+    fn fetch_game_state(&self, ctx: &egui::Context) {
+        info!("Fetching game state for game ID: {}", self.game_id);
 
-        info!("Manually broadcasting game state for debug purposes");
-
-        let response = self
-            .game_service
-            .client
-            .post(format!("{}/broadcast_state", self.game_service.server_url))
-            .json(&serde_json::json!({ "game_id": self.game_id }))
-            .send();
-
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                info!(
-                    "Successfully broadcasted game state for game ID: {}",
-                    self.game_id
-                );
-            }
-            Ok(resp) => {
-                self.error_message = Some(format!(
-                    "Failed to broadcast game state. Server responded with status: {}",
-                    resp.status()
-                ));
+        match self.game_service.fetch_game_state(&self.game_id) {
+            Ok(_) => {
+                info!("Game state fetched successfully");
+                ctx.request_repaint(); // Trigger UI update to reflect changes
             }
             Err(e) => {
-                self.error_message = Some(format!("Error broadcasting game state: {}", e));
+                error!("Failed to fetch game state: {}", e);
             }
         }
     }
