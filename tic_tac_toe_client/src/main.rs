@@ -386,6 +386,11 @@ impl eframe::App for GameApp {
                         ui.colored_label(egui::Color32::RED, error);
                         ui.add_space(10.0);
                     }
+                    if self.joined {
+                        if ui.button("Debug: Broadcast State").clicked() {
+                            self.broadcast_game_state();
+                        }
+                    }
 
                     // Game Board and Status
                     if self.joined && self.player.is_some() {
@@ -451,6 +456,38 @@ impl GameApp {
                 });
             }
         });
+    }
+    fn broadcast_game_state(&mut self) {
+        if self.loading {
+            return;
+        }
+
+        info!("Manually broadcasting game state for debug purposes");
+
+        let response = self
+            .game_service
+            .client
+            .post(format!("{}/broadcast_state", self.game_service.server_url))
+            .json(&serde_json::json!({ "game_id": self.game_id }))
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    "Successfully broadcasted game state for game ID: {}",
+                    self.game_id
+                );
+            }
+            Ok(resp) => {
+                self.error_message = Some(format!(
+                    "Failed to broadcast game state. Server responded with status: {}",
+                    resp.status()
+                ));
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Error broadcasting game state: {}", e));
+            }
+        }
     }
 
     fn display_game_status(&self, ui: &mut egui::Ui) {

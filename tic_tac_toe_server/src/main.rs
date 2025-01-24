@@ -361,6 +361,33 @@ async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String>
     games.insert(game_id.clone(), Game::default());
     Json(game_id)
 }
+async fn broadcast_state_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Json<Result<(), String>> {
+    let game_id = match req.get("game_id").and_then(|id| id.as_str()) {
+        Some(id) => id,
+        None => return Json(Err("Missing game_id".to_string())),
+    };
+
+    info!("Broadcasting state for game ID: {}", game_id);
+
+    let games = state.games.read().unwrap();
+    if let Some(game) = games.get(game_id) {
+        if let Err(e) = state.tx.send((game_id.to_string(), game.clone())) {
+            error!("Failed to broadcast game state: {:?}", e);
+            return Json(Err("Failed to broadcast game state".to_string()));
+        }
+        info!(
+            "Successfully broadcasted game state for game ID: {}",
+            game_id
+        );
+        Json(Ok(()))
+    } else {
+        error!("Game ID not found: {}", game_id);
+        Json(Err("Game not found".to_string()))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -383,6 +410,7 @@ async fn main() {
         .route("/make_move", post(make_move_handler))
         .route("/reset", post(reset_handler))
         .route("/join_game", post(join_game_handler))
+        .route("/broadcast_state", post(broadcast_state_handler))
         .route("/ws", get(ws_handler))
         .layer(cors)
         .with_state(Arc::clone(&app_state));
