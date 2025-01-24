@@ -286,6 +286,7 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppS
     let mut rx = state.tx.subscribe();
     let ping_interval = tokio::time::interval(Duration::from_secs(30)); // Ping every 30 seconds
     tokio::pin!(ping_interval);
+    debug!("Current subscribers: {}", state.tx.receiver_count());
 
     loop {
         tokio::select! {
