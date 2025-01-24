@@ -186,7 +186,11 @@ impl GameService {
         let game_clone = self.get_game();
 
         // Dynamically construct WebSocket URL
-        let websocket_url = format!("{}/ws", self.server_url.replace("https", "wss"));
+        let websocket_url = self
+            .server_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            + "/ws";
 
         thread::spawn(move || {
             let mut retries = 0;
@@ -441,27 +445,12 @@ impl GameApp {
                         );
 
                         if button.clicked() && cell.is_none() {
-                            self.make_move(self.player.unwrap(), row, col, ui.ctx());
+                            self.make_move(self.player.unwrap(), row, col);
                         }
                     }
                 });
             }
         });
-    }
-
-    fn make_move(&mut self, player: Player, row: usize, col: usize, ctx: &egui::Context) {
-        if self.loading {
-            return;
-        }
-
-        info!("Player {:?} making move at ({}, {})", player, row, col);
-
-        if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
-            self.error_message = Some(format!("Error making move: {}", e));
-        } else {
-            // Game state is already updated in make_move
-            ctx.request_repaint(); // Re-render the board to reflect the new state
-        }
     }
 
     fn display_game_status(&self, ui: &mut egui::Ui) {
@@ -486,6 +475,18 @@ impl GameApp {
                     .size(30.0)
                     .color(egui::Color32::from_rgb(0, 255, 0)),
             );
+        }
+    }
+
+    fn make_move(&mut self, player: Player, row: usize, col: usize) {
+        if self.loading {
+            return;
+        }
+
+        info!("Player {:?} making move at ({}, {})", player, row, col);
+
+        if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
+            self.error_message = Some(format!("Error making move: {}", e));
         }
     }
 

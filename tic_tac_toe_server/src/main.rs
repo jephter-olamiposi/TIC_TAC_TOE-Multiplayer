@@ -240,12 +240,22 @@ async fn make_move_handler(
             req.game_id, req.player, req.x, req.y
         );
 
+        // Log the updated game state
+        debug!("Game state after move: {:?}", game);
+
         // Broadcast the game state update
         if let Err(e) = state.tx.send((req.game_id.clone(), game.clone())) {
-            error!("Failed to broadcast game update: {:?}", e);
+            error!(
+                "Failed to broadcast game update for game_id {}: {:?}",
+                req.game_id, e
+            );
+            debug!("Current subscribers count: {}", state.tx.receiver_count());
+        } else {
+            debug!(
+                "Successfully broadcasted game state for game_id {}",
+                req.game_id
+            );
         }
-    } else {
-        error!("Move failed: game_id={}, error={:?}", req.game_id, result);
     }
 
     Json(result.map(|_| "Move made".to_string()))
@@ -354,7 +364,7 @@ async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String>
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let (tx, _) = broadcast::channel(100); // Set the buffer size to 100 (or larger if needed)
+    let (tx, _) = broadcast::channel(1000); // Set the buffer size to 100 (or larger if needed)
 
     let app_state = Arc::new(AppState {
         games: Arc::new(RwLock::new(HashMap::new())),
