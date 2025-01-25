@@ -257,7 +257,9 @@ pub struct GameApp {
 impl Default for GameApp {
     fn default() -> Self {
         Self {
-            game_service: GameService::new("http://0.0.0.0:3000".to_string()),
+            game_service: GameService::new(
+                "https://tic-tac-toe-multiplayer-zg0e.onrender.com".to_string(),
+            ),
             game_id: String::new(),
             input_game_id: String::new(),
             joined: false,
