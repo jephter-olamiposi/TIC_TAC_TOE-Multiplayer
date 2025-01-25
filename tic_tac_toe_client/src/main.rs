@@ -200,45 +200,51 @@ impl GameService {
             .replace("http://", "ws://")
             + "/ws";
 
+        // Inside `start_websocket_listener` in GameService
         thread::spawn(move || {
             let mut retries = 0;
             let max_retries = 5;
             let backoff_duration = Duration::from_secs(2);
 
-            while retries < max_retries {
-                if let Ok((mut socket, _)) = connect(&websocket_url) {
-                    info!("WebSocket connection established for game ID: {}", game_id);
-                    retries = 0;
+            loop {
+                match connect(&websocket_url) {
+                    Ok((mut socket, _)) => {
+                        info!("WebSocket connected for game ID: {}", game_id);
+                        retries = 0;
 
-                    while let Ok(msg) = socket.read() {
-                        if let Message::Text(text) = msg {
-                            if let Ok((received_game_id, received_game)) =
-                                serde_json::from_str::<(String, Game)>(&text)
-                            {
-                                if received_game_id == game_id {
-                                    let mut game = game_clone.lock().unwrap();
-                                    *game = received_game;
-                                    ctx.request_repaint();
-                                    info!("Game state updated for game ID: {}", game_id);
+                        while let Ok(msg) = socket.read() {
+                            if let Message::Text(text) = msg {
+                                if let Ok((received_game_id, received_game)) =
+                                    serde_json::from_str::<(String, Game)>(&text)
+                                {
+                                    if received_game_id == game_id {
+                                        let mut game = game_clone.lock().unwrap();
+                                        *game = received_game;
+                                        ctx.request_repaint();
+                                        info!("Game state updated for game ID: {}", game_id);
+                                    }
                                 }
                             }
                         }
                     }
-                } else {
-                    retries += 1;
-                    error!(
-                        "WebSocket connection failed for game ID: {}. Retry {}/{}",
-                        game_id, retries, max_retries
-                    );
-                    thread::sleep(backoff_duration * retries as u32);
-                }
-            }
+                    Err(err) => {
+                        retries += 1;
+                        error!(
+                            "WebSocket connection failed: {}. Retry {}/{}",
+                            err, retries, max_retries
+                        );
 
-            if retries >= max_retries {
-                error!(
-                    "WebSocket connection failed after {} retries for game ID: {}",
-                    max_retries, game_id
-                );
+                        if retries >= max_retries {
+                            error!(
+                                "WebSocket failed to reconnect after {} retries for game ID: {}",
+                                max_retries, game_id
+                            );
+                            break;
+                        }
+
+                        thread::sleep(backoff_duration);
+                    }
+                }
             }
         });
     }

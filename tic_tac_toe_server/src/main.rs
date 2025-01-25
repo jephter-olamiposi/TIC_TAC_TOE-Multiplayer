@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -155,7 +156,7 @@ async fn join_game_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGameRequest>,
 ) -> Json<Result<Player, String>> {
-    let mut games = state.games.write().unwrap();
+    let mut games = state.games.write().await;
 
     // Retrieve or initialize the game
     let game = games
@@ -211,7 +212,7 @@ async fn get_state_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<Game> {
-    let games = state.games.read().unwrap();
+    let games = state.games.read().await;
     let game = games.get(&game_id).cloned().unwrap_or_default();
     debug!("State fetched for game {}: {:?}", game_id, game);
     Json(game)
@@ -222,7 +223,7 @@ async fn make_move_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MoveRequest>,
 ) -> Json<Result<String, String>> {
-    let mut games = state.games.write().unwrap();
+    let mut games = state.games.write().await;
     let game = games.entry(req.game_id.clone()).or_default();
     let result = game.make_move(req.player, req.x, req.y);
 
@@ -244,7 +245,7 @@ async fn reset_handler(
     State(state): State<Arc<AppState>>,
     Json(game_id): Json<String>,
 ) -> Json<String> {
-    let mut games = state.games.write().unwrap();
+    let mut games = state.games.write().await;
     let game = games.entry(game_id.clone()).or_default();
     game.reset();
     let _ = state.tx.send((game_id.clone(), game.clone()));
@@ -273,7 +274,7 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppS
             .await
             .is_err()
         {
-            error!("WebSocket connection dropped.");
+            error!("WebSocket client disconnected. Stopping updates.");
             break;
         }
     }
@@ -284,7 +285,7 @@ async fn cleanup_inactive_games(app_state: Arc<AppState>) {
     let timeout = Duration::from_secs(1800); // 30 minutes
     loop {
         {
-            let mut games = app_state.games.write().unwrap();
+            let mut games = app_state.games.write().await;
             let before_cleanup = games.len();
             games.retain(|_, game| game.last_activity.elapsed().unwrap_or(timeout) < timeout);
             let after_cleanup = games.len();
@@ -302,7 +303,7 @@ async fn cleanup_inactive_games(app_state: Arc<AppState>) {
 // Handler to create a new game
 async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String> {
     let game_id = Uuid::new_v4().to_string();
-    let mut games = state.games.write().unwrap();
+    let mut games = state.games.write().await;
     games.insert(game_id.clone(), Game::default());
     info!("New game created with ID: {}", game_id);
     Json(game_id)
