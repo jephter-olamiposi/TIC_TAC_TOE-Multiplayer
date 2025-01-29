@@ -337,7 +337,6 @@ async fn main() {
     // Use the PORT environment variable provided by Render
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
-    let addr = format!("0.0.0.0:3000");
 
     let listener = TcpListener::bind(&addr)
         .await

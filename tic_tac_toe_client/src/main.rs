@@ -58,7 +58,10 @@ impl GameService {
             .client
             .post(format!("{}/create_game", self.server_url))
             .send()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                error!("failed to create gamee : {:?}", e);
+                e.to_string()
+            })?;
 
         response.json::<String>().map_err(|e| e.to_string())
     }
