@@ -127,26 +127,44 @@ impl GameService {
             })
     }
 
-    pub fn fetch_game_state(&self, game_id: &str) -> Result<(), String> {
+    pub fn fetch_game_state(&self, game_id: &str, ctx: &egui::Context) -> Result<(), String> {
         let response = self
             .client
             .post(format!("{}/state", self.server_url))
-            .json(&game_id)
+            .json(&serde_json::json!({ "game_id": game_id }))
             .send();
 
-        response.map_err(|e| e.to_string()).and_then(|resp| {
-            if resp.status().is_success() {
-                let new_game = resp.json::<Game>().map_err(|e| e.to_string())?;
-                let mut game = self.game.lock().unwrap();
-                *game = new_game;
-                info!("Fetched new game state for game ID: {}", game_id);
-                Ok(())
-            } else if resp.status() == 404 {
-                Err("Game not found. It may have expired.".to_string())
-            } else {
-                Err(format!("Server error: {}", resp.status()))
-            }
-        })
+        response
+            .map_err(|e| {
+                error!("Failed to fetch game state: {}", e);
+                e.to_string()
+            })
+            .and_then(|resp| {
+                if resp.status().is_success() {
+                    match resp.json::<Game>() {
+                        Ok(new_game) => {
+                            debug!("Fetched game state: {:?}", new_game);
+                            let mut game = self.game.lock().unwrap();
+                            *game = new_game;
+
+                            // ✅ Force UI update after state update
+                            ctx.request_repaint();
+
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!("JSON parse error when fetching game state: {}", e);
+                            Err(e.to_string())
+                        }
+                    }
+                } else {
+                    error!(
+                        "Server returned status {} when fetching game state",
+                        resp.status()
+                    );
+                    Err(format!("Server error: {}", resp.status()))
+                }
+            })
     }
 
     pub fn make_move(
@@ -155,6 +173,7 @@ impl GameService {
         player: Player,
         row: usize,
         col: usize,
+        ctx: &egui::Context,
     ) -> Result<(), String> {
         let response = self
             .client
@@ -167,13 +186,20 @@ impl GameService {
             }))
             .send();
 
-        response.map_err(|e| e.to_string()).and_then(|resp| {
-            if resp.status().is_success() {
-                self.fetch_game_state(game_id).map(|_| ())
-            } else {
-                Err(format!("Server error: {}", resp.status()))
-            }
-        })
+        response
+            .map_err(|e| {
+                error!("Failed to make move: {}", e);
+                e.to_string()
+            })
+            .and_then(|resp| {
+                if resp.status().is_success() {
+                    debug!("Move successful, fetching latest game state...");
+                    self.fetch_game_state(game_id, ctx).map(|_| ())
+                } else {
+                    error!("Server error: {}", resp.status());
+                    Err(format!("Server error: {}", resp.status()))
+                }
+            })
     }
 
     pub fn reset_game(&self, game_id: &str) -> Result<(), String> {
@@ -203,7 +229,6 @@ impl GameService {
             .replace("http://", "ws://")
             + "/ws";
 
-        // Inside `start_websocket_listener` in GameService
         thread::spawn(move || {
             let mut retries = 0;
             let max_retries = 5;
@@ -223,6 +248,8 @@ impl GameService {
                                     if received_game_id == game_id {
                                         let mut game = game_clone.lock().unwrap();
                                         *game = received_game;
+
+                                        // ✅ Ensure UI repaint in main thread
                                         ctx.request_repaint();
                                         info!("Game state updated for game ID: {}", game_id);
                                     }
@@ -367,7 +394,8 @@ impl eframe::App for GameApp {
 
                     // Game Board and Status
                     if self.joined && self.player.is_some() {
-                        self.render_board(ui);
+                        self.render_board(ui, ctx);
+
                         ui.add_space(20.0);
                         self.display_game_status(ui);
 
@@ -383,7 +411,7 @@ impl eframe::App for GameApp {
                                 )
                                 .clicked()
                             {
-                                self.reset_game();
+                                self.reset_game(ctx);
                             }
                         }
                     }
@@ -394,7 +422,7 @@ impl eframe::App for GameApp {
 }
 
 impl GameApp {
-    fn render_board(&mut self, ui: &mut egui::Ui) {
+    fn render_board(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let game = self.game_service.get_game();
         let button_size = 100.0;
 
@@ -423,7 +451,9 @@ impl GameApp {
                         );
 
                         if button.clicked() && cell.is_none() {
-                            self.make_move(self.player.unwrap(), row, col);
+                            self.make_move(self.player.unwrap(), row, col, ctx);
+
+                            // 🔴 Pass ctx here
                         }
                     }
                 });
@@ -467,11 +497,15 @@ impl GameApp {
             Ok(player) => {
                 self.player = Some(player);
                 self.joined = true;
-                self.game_service.fetch_game_state(&self.game_id).unwrap();
+                self.game_service
+                    .fetch_game_state(&self.game_id, ctx)
+                    .unwrap();
 
                 // Wrap the context in an Arc before passing it
+
                 self.game_service
                     .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
+
                 info!("Successfully joined game with ID: {}", self.game_id);
             }
             Err(e) => {
@@ -482,19 +516,22 @@ impl GameApp {
         self.loading = false;
     }
 
-    fn make_move(&mut self, player: Player, row: usize, col: usize) {
+    fn make_move(&mut self, player: Player, row: usize, col: usize, ctx: &egui::Context) {
         if self.loading {
             return;
         }
 
         info!("Player {:?} making move at ({}, {})", player, row, col);
 
-        if let Err(e) = self.game_service.make_move(&self.game_id, player, row, col) {
+        if let Err(e) = self
+            .game_service
+            .make_move(&self.game_id, player, row, col, ctx)
+        {
             self.error_message = Some(format!("Error making move: {}", e));
         }
     }
 
-    fn reset_game(&mut self) {
+    fn reset_game(&mut self, ctx: &egui::Context) {
         self.loading = true;
         self.error_message = None;
 
@@ -502,6 +539,10 @@ impl GameApp {
 
         if let Err(e) = self.game_service.reset_game(&self.game_id) {
             self.error_message = Some(format!("Error resetting game: {}", e));
+        } else {
+            self.game_service
+                .fetch_game_state(&self.game_id, ctx)
+                .unwrap();
         }
 
         self.loading = false;

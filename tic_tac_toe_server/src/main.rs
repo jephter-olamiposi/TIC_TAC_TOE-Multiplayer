@@ -157,53 +157,33 @@ async fn join_game_handler(
     Json(req): Json<JoinGameRequest>,
 ) -> Json<Result<Player, String>> {
     let mut games = state.games.write().await;
-
-    // Retrieve or initialize the game
     let game = games
         .entry(req.game_id.clone())
         .or_insert_with(Game::default);
 
-    // Check if the game is full
+    // If game is already full, reject the request
     if game.players.len() >= 2 {
-        error!("Join game failed: Game {} is already full.", req.game_id);
         return Json(Err("Game is already full.".to_string()));
     }
 
-    // Handle explicit player symbol requests
-    if let Some(requested_player) = req.player {
-        if game.players.contains(&requested_player) {
-            // Requested player is already taken
-            error!(
-                "Join game failed: Player {:?} already taken in game {}.",
-                requested_player, req.game_id
-            );
-            return Json(Err(format!(
-                "Player {:?} is already taken. Choose a different symbol.",
-                requested_player
-            )));
+    // Assign the player (or choose automatically)
+    let assigned_player = match req.player {
+        Some(requested) if !game.players.contains(&requested) => requested,
+        Some(_) => return Json(Err("Player already taken.".to_string())),
+        None => {
+            if game.players.contains(&Player::X) {
+                Player::O
+            } else {
+                Player::X
+            }
         }
-
-        // Assign the requested player
-        game.players.push(requested_player);
-        info!(
-            "Player {:?} successfully joined game {} as the first player.",
-            requested_player, req.game_id
-        );
-        return Json(Ok(requested_player));
-    }
-
-    // Automatically assign the opposite symbol for the second player
-    let assigned_player = if game.players.contains(&Player::X) {
-        Player::O
-    } else {
-        Player::X
     };
 
     game.players.push(assigned_player);
-    info!(
-        "Player {:?} automatically assigned to game {} as the second player.",
-        assigned_player, req.game_id
-    );
+
+    // ✅ Broadcast game state after a player joins
+    let _ = state.tx.send((req.game_id.clone(), game.clone()));
+
     Json(Ok(assigned_player))
 }
 
@@ -221,20 +201,20 @@ async fn get_state_handler(
 // Handler to make a move in a game
 async fn make_move_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<MoveRequest>,
+    req: Result<Json<MoveRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Json<Result<String, String>> {
+    // Handle invalid JSON requests
+    let req = match req {
+        Ok(req) => req.0, // Extract the MoveRequest
+        Err(_) => return Json(Err("Invalid JSON format".to_string())),
+    };
+
     let mut games = state.games.write().await;
     let game = games.entry(req.game_id.clone()).or_default();
     let result = game.make_move(req.player, req.x, req.y);
 
     if result.is_ok() {
-        let _ = state.tx.send((req.game_id.clone(), game.clone()));
-        info!(
-            "Move made in game {}: Player {:?} to ({}, {}).",
-            req.game_id, req.player, req.x, req.y
-        );
-    } else {
-        error!("Move failed in game {}: {:?}", req.game_id, result);
+        let _ = state.tx.send((req.game_id.clone(), game.clone())); // Broadcast the new game state
     }
 
     Json(result.map(|_| "Move made".to_string()))
@@ -266,6 +246,21 @@ async fn ws_handler(
 async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx.subscribe();
 
+    // ✅ Fetch all current game states and send them to the new client immediately
+    {
+        let games = state.games.read().await;
+        for (game_id, game) in games.iter() {
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(
+                    serde_json::to_string(&(game_id.clone(), game.clone()))
+                        .unwrap()
+                        .into(),
+                ))
+                .await;
+        }
+    } // 🔴 Unlock read access here before listening for updates
+
+    // ✅ Listen for real-time updates and broadcast changes
     while let Ok((game_id, game)) = rx.recv().await {
         if socket
             .send(axum::extract::ws::Message::Text(
@@ -283,11 +278,18 @@ async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppS
 // Periodically cleans up inactive games
 async fn cleanup_inactive_games(app_state: Arc<AppState>) {
     let timeout = Duration::from_secs(1800); // 30 minutes
+
     loop {
         {
             let mut games = app_state.games.write().await;
             let before_cleanup = games.len();
-            games.retain(|_, game| game.last_activity.elapsed().unwrap_or(timeout) < timeout);
+            for (game_id, game) in games.iter_mut() {
+                if game.last_activity.elapsed().unwrap_or(timeout) >= timeout {
+                    game.reset(); // Reset instead of deleting
+                    let _ = app_state.tx.send((game_id.clone(), game.clone()));
+                    info!("Inactive game {} has been reset.", game_id);
+                }
+            }
             let after_cleanup = games.len();
             if before_cleanup != after_cleanup {
                 info!(
