@@ -362,11 +362,6 @@ async fn main() {
         tx,
     });
 
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
-
     let app = Router::new()
         .route("/create_game", post(create_game_handler))
         .route("/state", post(get_state_handler))
@@ -374,7 +369,6 @@ async fn main() {
         .route("/reset", post(reset_handler))
         .route("/join_game", post(join_game_handler))
         .route("/ws", get(ws_handler))
-        .layer(cors)
         .with_state(Arc::clone(&app_state));
 
     // Use the PORT environment variable provided by Render
