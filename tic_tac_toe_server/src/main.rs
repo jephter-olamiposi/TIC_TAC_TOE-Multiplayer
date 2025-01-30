@@ -4,6 +4,8 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+
 use std::{
     collections::HashMap,
     env,
@@ -17,6 +19,7 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Player {
     X,
     O,
@@ -137,39 +140,46 @@ pub struct AppState {
     tx: broadcast::Sender<(String, Game)>,     // Broadcast channel for game updates
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct MoveRequest {
-    game_id: String, // ID of the game where the move is made
-    player: Player,  // Player making the move
-    x: usize,        // Row of the move
-    y: usize,        // Column of the move
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JoinGameRequest {
-    game_id: String,        // ID of the game to join
-    player: Option<Player>, // Optional symbol choice (X or O)
+    pub game_id: String,
+    pub player: Option<Player>,
 }
 
-// Handler to join a game
+#[derive(Debug, Serialize, Deserialize)] // ✅ Add Debug
+pub struct MoveRequest {
+    pub game_id: String, // ID of the game where the move is made
+    pub player: Player,  // Player making the move
+    pub x: usize,        // Row of the move
+    pub y: usize,        // Column of the move
+}
+
 async fn join_game_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGameRequest>,
 ) -> Json<Result<Player, String>> {
+    // ✅ Return Player enum
+    debug!("Received join request: {:?}", req);
+
     let mut games = state.games.write().await;
     let game = games
         .entry(req.game_id.clone())
         .or_insert_with(Game::default);
 
-    // If game is already full, reject the request
     if game.players.len() >= 2 {
+        error!("Join request rejected: Game {} is full", req.game_id);
         return Json(Err("Game is already full.".to_string()));
     }
 
-    // Assign the player (or choose automatically)
     let assigned_player = match req.player {
         Some(requested) if !game.players.contains(&requested) => requested,
-        Some(_) => return Json(Err("Player already taken.".to_string())),
+        Some(_) => {
+            error!(
+                "Join request rejected: Player {:?} already taken in game {}",
+                req.player, req.game_id
+            );
+            return Json(Err("Player already taken.".to_string()));
+        }
         None => {
             if game.players.contains(&Player::X) {
                 Player::O
@@ -180,22 +190,39 @@ async fn join_game_handler(
     };
 
     game.players.push(assigned_player);
-
-    // ✅ Broadcast game state after a player joins
     let _ = state.tx.send((req.game_id.clone(), game.clone()));
 
-    Json(Ok(assigned_player))
+    info!(
+        "Player {:?} successfully joined game {}",
+        assigned_player, req.game_id
+    );
+
+    Json(Ok(assigned_player)) // ✅ Return `Player` enum directly
 }
 
 // Handler to fetch the state of a game
 async fn get_state_handler(
     State(state): State<Arc<AppState>>,
-    Json(game_id): Json<String>,
-) -> Json<Game> {
+    Json(payload): Json<serde_json::Value>, // ✅ Expect JSON input
+) -> Json<serde_json::Value> {
+    debug!("📥 Received get_state request: {:?}", payload);
+
+    let game_id = match payload.get("game_id").and_then(|id| id.as_str()) {
+        Some(id) => id,
+        None => {
+            error!("❌ Invalid request: Missing or incorrect 'game_id'");
+            return Json(json!({ "Err": "Invalid request: Missing game_id" }));
+        }
+    };
+
     let games = state.games.read().await;
-    let game = games.get(&game_id).cloned().unwrap_or_default();
-    debug!("State fetched for game {}: {:?}", game_id, game);
-    Json(game)
+    if let Some(game) = games.get(game_id) {
+        debug!("✅ Returning game state for {}", game_id);
+        Json(json!(game))
+    } else {
+        error!("❌ Game {} not found", game_id);
+        Json(json!({ "Err": "Game not found" }))
+    }
 }
 
 // Handler to make a move in a game
@@ -206,8 +233,13 @@ async fn make_move_handler(
     // Handle invalid JSON requests
     let req = match req {
         Ok(req) => req.0, // Extract the MoveRequest
-        Err(_) => return Json(Err("Invalid JSON format".to_string())),
+        Err(_) => {
+            error!("Invalid JSON format received for make_move.");
+            return Json(Err("Invalid JSON format".to_string()));
+        }
     };
+
+    debug!("Received make_move request: {:?}", req);
 
     let mut games = state.games.write().await;
     let game = games.entry(req.game_id.clone()).or_default();
@@ -215,6 +247,15 @@ async fn make_move_handler(
 
     if result.is_ok() {
         let _ = state.tx.send((req.game_id.clone(), game.clone())); // Broadcast the new game state
+        info!(
+            "Move made: Game ID: {}, Player: {:?}, Position: ({}, {})",
+            req.game_id, req.player, req.x, req.y
+        );
+    } else {
+        error!(
+            "Move rejected: Game ID: {}, Player: {:?}, Position: ({}, {}). Reason: {:?}",
+            req.game_id, req.player, req.x, req.y, result
+        );
     }
 
     Json(result.map(|_| "Move made".to_string()))
