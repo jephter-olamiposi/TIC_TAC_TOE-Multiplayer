@@ -8,6 +8,7 @@ use serde_json::json;
 
 use anyhow::Result;
 
+use std::env;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -521,8 +522,8 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .with_state(Arc::clone(&app_state));
 
-    // let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    let addr = format!("0.0.0.0:3000");
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
 
     let listener = TcpListener::bind(&addr)
         .await
