@@ -862,7 +862,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite",
- "uuid",
 ]
 
 [[package]]
@@ -1043,15 +1042,6 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
-
-[[package]]
-name = "uuid"
-version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3758f5e68192bb96cc8f9b7e2c2cfdabb435499a28499a42f8f984092adad4b"
-dependencies = [
- "getrandom",
-]
 
 [[package]]
 name = "valuable"
