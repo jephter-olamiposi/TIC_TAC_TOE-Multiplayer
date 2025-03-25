@@ -86,7 +86,7 @@ impl Game {
 
         if self.check_winner().is_some() {
             self.game_over = true;
-            *self.scores.entry(player).or_insert(0) += 1; // ✅ Increment score
+            *self.scores.entry(player).or_insert(0) += 1;
             debug!("Game over: {:?} wins. Score updated.", player);
         } else if self.is_full() {
             self.game_over = true;
