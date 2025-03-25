@@ -11,13 +11,12 @@ A real-time multiplayer Tic-Tac-Toe game built fully in Rust — featuring a nat
 - Player name input and live scoreboard
 - Clean turn-based logic with win/draw detection
 - Game state is kept in sync across clients
-- WebSocket to /ws, real-time JSON sync
 - Uses **SplitSink** and **SplitStream** to cleanly separate read/write WebSocket channels
 - Server state stored with **RwLock<HashMap<String, Game>>** for concurrent safety
 - Built-in auto-reconnect if connection drops
 - Periodic cleanup of inactive games
 - Native UI 
-- Clear and modular codebase — no unnecessary abstractions, every line does work
+- Clear and modular codebase 
 
 ---
 
