@@ -1,14 +1,15 @@
 use axum::{
-    extract::{Json, State, WebSocketUpgrade},
-    routing::{get, post},
+    extract::{State, WebSocketUpgrade},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use anyhow::Result;
+
 use std::{
     collections::HashMap,
-    env,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -16,9 +17,9 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
-use uuid::Uuid;
+use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Player {
     X,
@@ -33,6 +34,8 @@ pub struct Game {
     pub draw: bool,                      // Indicates if the game ended in a draw
     pub last_activity: SystemTime,       // Timestamp of the last game activity
     pub players: Vec<Player>,            // List of players who joined the game
+    pub scores: HashMap<Player, u32>,
+    pub player_names: HashMap<Player, String>,
 }
 
 impl Default for Game {
@@ -44,15 +47,39 @@ impl Default for Game {
             draw: false,
             last_activity: SystemTime::now(),
             players: Vec::new(),
+            player_names: HashMap::new(),
+            scores: [(Player::X, 0), (Player::O, 0)].into_iter().collect(),
         }
     }
 }
 
 impl Game {
     // Resets the game to its default state
-    fn reset(&mut self) {
-        *self = Game::default();
-        debug!("Game reset to default state.");
+    pub fn reset(&mut self) {
+        let players = self.players.clone();
+        let names = self.player_names.clone();
+        let scores = self.scores.clone();
+        let previous_first = self.current_turn;
+
+        // Instead of full default, create new Game manually so we can set current_turn properly
+        let mut new_game = Game::default();
+
+        new_game.players = players;
+        new_game.player_names = names;
+        new_game.scores = scores;
+
+        // ✅ Alternate who plays first
+        new_game.current_turn = match previous_first {
+            Player::X => Player::O,
+            Player::O => Player::X,
+        };
+
+        *self = new_game;
+
+        debug!(
+            "Game reset. New first player: {:?}, Names: {:?}, Scores: {:?}",
+            self.current_turn, self.player_names, self.scores
+        );
     }
 
     // Handles making a move on the board
@@ -78,7 +105,8 @@ impl Game {
 
         if self.check_winner().is_some() {
             self.game_over = true;
-            debug!("Game over: {:?} wins.", player);
+            *self.scores.entry(player).or_insert(0) += 1; // ✅ Increment score
+            debug!("Game over: {:?} wins. Score updated.", player);
         } else if self.is_full() {
             self.game_over = true;
             self.draw = true;
@@ -154,166 +182,307 @@ pub struct MoveRequest {
     pub y: usize,        // Column of the move
 }
 
-async fn join_game_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<JoinGameRequest>,
-) -> Json<Result<Player, String>> {
-    // ✅ Return Player enum
-    debug!("Received join request: {:?}", req);
-
-    let mut games = state.games.write().await;
-    let game = games
-        .entry(req.game_id.clone())
-        .or_insert_with(Game::default);
-
-    if game.players.len() >= 2 {
-        error!("Join request rejected: Game {} is full", req.game_id);
-        return Json(Err("Game is already full.".to_string()));
-    }
-
-    let assigned_player = match req.player {
-        Some(requested) if !game.players.contains(&requested) => requested,
-        Some(_) => {
-            error!(
-                "Join request rejected: Player {:?} already taken in game {}",
-                req.player, req.game_id
-            );
-            return Json(Err("Player already taken.".to_string()));
-        }
-        None => {
-            if game.players.contains(&Player::X) {
-                Player::O
-            } else {
-                Player::X
-            }
-        }
-    };
-
-    game.players.push(assigned_player);
-    let _ = state.tx.send((req.game_id.clone(), game.clone()));
-
-    info!(
-        "Player {:?} successfully joined game {}",
-        assigned_player, req.game_id
-    );
-
-    Json(Ok(assigned_player)) // ✅ Return `Player` enum directly
-}
-
-// Handler to fetch the state of a game
-async fn get_state_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<serde_json::Value>, // ✅ Expect JSON input
-) -> Json<serde_json::Value> {
-    debug!("📥 Received get_state request: {:?}", payload);
-
-    let game_id = match payload.get("game_id").and_then(|id| id.as_str()) {
-        Some(id) => id,
-        None => {
-            error!("❌ Invalid request: Missing or incorrect 'game_id'");
-            return Json(json!({ "Err": "Invalid request: Missing game_id" }));
-        }
-    };
-
-    let games = state.games.read().await;
-    if let Some(game) = games.get(game_id) {
-        debug!("✅ Returning game state for {}", game_id);
-        Json(json!(game))
-    } else {
-        error!("❌ Game {} not found", game_id);
-        Json(json!({ "Err": "Game not found" }))
-    }
-}
-
-// Handler to make a move in a game
-async fn make_move_handler(
-    State(state): State<Arc<AppState>>,
-    req: Result<Json<MoveRequest>, axum::extract::rejection::JsonRejection>,
-) -> Json<Result<String, String>> {
-    // Handle invalid JSON requests
-    let req = match req {
-        Ok(req) => req.0, // Extract the MoveRequest
-        Err(_) => {
-            error!("Invalid JSON format received for make_move.");
-            return Json(Err("Invalid JSON format".to_string()));
-        }
-    };
-
-    debug!("Received make_move request: {:?}", req);
-
-    let mut games = state.games.write().await;
-    let game = games.entry(req.game_id.clone()).or_default();
-    let result = game.make_move(req.player, req.x, req.y);
-
-    if result.is_ok() {
-        let _ = state.tx.send((req.game_id.clone(), game.clone())); // Broadcast the new game state
-        info!(
-            "Move made: Game ID: {}, Player: {:?}, Position: ({}, {})",
-            req.game_id, req.player, req.x, req.y
-        );
-    } else {
-        error!(
-            "Move rejected: Game ID: {}, Player: {:?}, Position: ({}, {}). Reason: {:?}",
-            req.game_id, req.player, req.x, req.y, result
-        );
-    }
-
-    Json(result.map(|_| "Move made".to_string()))
-}
-
-// Handler to reset a game
-async fn reset_handler(
-    State(state): State<Arc<AppState>>,
-    Json(game_id): Json<String>,
-) -> Json<String> {
-    let mut games = state.games.write().await;
-    let game = games.entry(game_id.clone()).or_default();
-    game.reset();
-    let _ = state.tx.send((game_id.clone(), game.clone()));
-    info!("Game {} has been reset.", game_id);
-    Json("Game reset".to_string())
-}
-
 // WebSocket handler to manage real-time updates
+
 #[axum::debug_handler]
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    info!("🔗 WebSocket connection attempt received!");
+
+    ws.on_upgrade(move |socket| async move {
+        info!("✅ WebSocket upgrade successful.");
+        if let Err(e) = handle_socket(socket, state).await {
+            error!("❌ WebSocket processing failed: {}", e);
+        }
+    })
 }
 
 // Handles WebSocket connections for broadcasting game updates
-async fn handle_socket(mut socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
+async fn handle_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    state: Arc<AppState>,
+) -> Result<()> {
     let mut rx = state.tx.subscribe();
+    let mut subscribed_game_id: Option<String> = None;
 
-    // ✅ Fetch all current game states and send them to the new client immediately
-    {
-        let games = state.games.read().await;
-        for (game_id, game) in games.iter() {
-            let _ = socket
-                .send(axum::extract::ws::Message::Text(
-                    serde_json::to_string(&(game_id.clone(), game.clone()))
-                        .unwrap()
-                        .into(),
-                ))
-                .await;
-        }
-    } // 🔴 Unlock read access here before listening for updates
+    info!("✅ WebSocket connection established.");
 
-    // ✅ Listen for real-time updates and broadcast changes
-    while let Ok((game_id, game)) = rx.recv().await {
-        if socket
-            .send(axum::extract::ws::Message::Text(
-                serde_json::to_string(&(game_id, game)).unwrap().into(),
-            ))
-            .await
-            .is_err()
-        {
-            error!("WebSocket client disconnected. Stopping updates.");
-            break;
+    loop {
+        info!("🕵️ Waiting for WebSocket message...");
+
+        tokio::select! {
+            Some(Ok(msg)) = socket.recv() => {
+                match msg {
+                    axum::extract::ws::Message::Text(text) => {
+                        info!("📩 Received WebSocket message: {}", text);
+
+                        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(json) => json,
+                            Err(_) => {
+                                error!("❌ Failed to parse WebSocket message: {}", text);
+                                continue;
+                            }
+                        };
+
+                        match parsed["type"].as_str() {
+                            Some("JOIN_GAME") => {
+                                info!("✅ Processing JOIN_GAME message.");
+                                handle_join_game(&parsed, &state, &mut socket).await?;
+                                subscribed_game_id = parsed["game_id"].as_str().map(|s| s.to_string());
+                            }
+                            Some("MAKE_MOVE") => {
+                                info!("✅ Processing MAKE_MOVE message.");
+                                handle_make_move(&parsed, &state, &mut socket).await?;
+                                if subscribed_game_id.is_none() {
+                                    subscribed_game_id = parsed["game_id"].as_str().map(|s| s.to_string());
+                                }
+                            }
+                            Some("RESET_GAME") => {
+                                info!("✅ Processing RESET_GAME message.");
+                                handle_reset_game(&parsed, &state).await?;
+                            }
+                            _ => error!("⚠️ Unknown message type received: {:?}", parsed["type"]),
+                        }
+                    }
+                    axum::extract::ws::Message::Ping(data) => {
+                        info!("📩 Received Ping: {:?}", data);
+                        socket.send(axum::extract::ws::Message::Pong(data)).await?;
+                    }
+                    axum::extract::ws::Message::Pong(data) => {
+                        info!("📩 Received Pong: {:?}", data);
+                    }
+                    axum::extract::ws::Message::Close(reason) => {
+                        info!("❌ WebSocket closed: {:?}", reason);
+                        break;
+                    }
+                    _ => error!("⚠️ Received unexpected WebSocket message."),
+                }
+            }
+
+            Ok((game_id, game)) = rx.recv() => {
+                info!("📩 WebSocket received game update for game_id={}", game_id);
+                if let Some(ref subscribed_id) = subscribed_game_id {
+                    if *subscribed_id == game_id {
+                        let game_update = json!({
+                            "type": "UPDATE_STATE",
+                            "game_id": game_id,
+                            "game": game
+                        });
+
+                        info!("📤 Sending WebSocket update: {}", game_update);
+                        if let Err(e) = socket
+                            .send(axum::extract::ws::Message::Text(game_update.to_string().into()))
+                            .await
+                        {
+                            error!("❌ Failed to send game update: {}", e);
+                        }
+                    }
+                }
+            }
+            else => {
+                error!("❌ WebSocket connection lost unexpectedly.");
+                break;
+            }
         }
     }
+
+    error!("❌ WebSocket closed. Cleaning up.");
+    Ok(())
+}
+
+async fn handle_join_game(
+    parsed: &serde_json::Value,
+    state: &Arc<AppState>,
+    socket: &mut axum::extract::ws::WebSocket,
+) -> Result<()> {
+    let game_id = parsed["game_id"].as_str().unwrap_or("").to_string();
+    let name = parsed["name"].as_str().unwrap_or("Anonymous").to_string();
+
+    info!(
+        "📥 Received JOIN_GAME request - Game ID: {}, Name: {}",
+        game_id, name
+    );
+
+    let mut games = state.games.write().await;
+    let game = games.entry(game_id.clone()).or_insert_with(|| {
+        info!("🆕 Creating new game with ID: {}", game_id);
+        Game::default()
+    });
+
+    if game.players.len() >= 2 {
+        error!("❌ Join request rejected: Game {} is full", game_id);
+        let error_message = json!({ "type": "ERROR", "message": "Game is full" });
+        socket
+            .send(axum::extract::ws::Message::Text(
+                error_message.to_string().into(),
+            ))
+            .await?;
+        return Ok(());
+    }
+
+    let assigned_player = if game.players.contains(&Player::X) {
+        Player::O
+    } else {
+        Player::X
+    };
+
+    game.players.push(assigned_player);
+    game.player_names.insert(assigned_player, name.clone());
+    game.scores.entry(assigned_player).or_insert(0);
+
+    let _ = state.tx.send((game_id.clone(), game.clone()));
+
+    info!(
+        "✅ Player {:?} ({}) successfully joined game {}",
+        assigned_player, name, game_id
+    );
+
+    let join_success_msg = json!({
+        "type": "JOIN_SUCCESS",
+        "player": assigned_player,
+        "game_id": game_id,
+        "name": name,
+        "scores": game.scores,
+        "names": game.player_names
+    });
+
+    socket
+        .send(axum::extract::ws::Message::Text(
+            join_success_msg.to_string().into(),
+        ))
+        .await?;
+
+    let game_update = json!({
+        "type": "UPDATE_STATE",
+        "game_id": game_id,
+        "game": game
+    });
+
+    socket
+        .send(axum::extract::ws::Message::Text(
+            game_update.to_string().into(),
+        ))
+        .await?;
+
+    Ok(())
+}
+
+async fn handle_make_move(
+    parsed: &serde_json::Value,
+    state: &Arc<AppState>,
+    socket: &mut axum::extract::ws::WebSocket,
+) -> Result<()> {
+    let game_id = parsed["game_id"].as_str().unwrap_or("").to_string();
+    let x = parsed["x"].as_u64().unwrap_or(100) as usize; // Default to invalid move
+    let y = parsed["y"].as_u64().unwrap_or(100) as usize; // Default invalid move
+
+    let player = match parsed["player"].as_str() {
+        Some("X") => Player::X,
+        Some("O") => Player::O,
+        _ => {
+            error!(
+                "❌ Invalid player received in MOVE request: {:?}",
+                parsed["player"]
+            );
+            let error_msg = json!({ "type": "MOVE_FAILED", "message": "Invalid player" });
+            socket
+                .send(axum::extract::ws::Message::Text(
+                    error_msg.to_string().into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        "📥 MOVE request received - Game ID: {}, Player: {:?}, Position: ({}, {})",
+        game_id, player, x, y
+    );
+
+    if x >= 3 || y >= 3 {
+        error!("❌ Invalid MOVE request: Out of bounds - ({}, {})", x, y);
+        let error_msg = json!({ "type": "MOVE_FAILED", "message": "Coordinates out of bounds" });
+        socket
+            .send(axum::extract::ws::Message::Text(
+                error_msg.to_string().into(),
+            ))
+            .await?;
+        return Ok(());
+    }
+
+    let mut games = state.games.write().await;
+    if let Some(game) = games.get_mut(&game_id) {
+        if !game.players.contains(&player) {
+            error!(
+                "❌ Player {:?} is not in game {}. Move rejected.",
+                player, game_id
+            );
+            let error_msg = json!({ "type": "MOVE_FAILED", "message": "Player not in game" });
+            socket
+                .send(axum::extract::ws::Message::Text(
+                    error_msg.to_string().into(),
+                ))
+                .await?;
+            return Ok(());
+        }
+
+        match game.make_move(player, x, y) {
+            Ok(_) => {
+                info!(
+                    "✅ Move applied: {:?} at ({}, {}) in game {}",
+                    player, x, y, game_id
+                );
+                let update_msg = json!({
+                    "type": "UPDATE_STATE",
+                    "game": game
+                });
+                let _ = state.tx.send((game_id.clone(), game.clone()));
+                socket
+                    .send(axum::extract::ws::Message::Text(
+                        update_msg.to_string().into(),
+                    ))
+                    .await?;
+            }
+            Err(err) => {
+                error!("❌ Move failed: {}", err);
+                let error_msg = json!({ "type": "MOVE_FAILED", "message": err });
+                socket
+                    .send(axum::extract::ws::Message::Text(
+                        error_msg.to_string().into(),
+                    ))
+                    .await?;
+            }
+        }
+    } else {
+        error!("❌ Game ID {} not found.", game_id);
+        let error_msg = json!({ "type": "MOVE_FAILED", "message": "Game ID not found." });
+        socket
+            .send(axum::extract::ws::Message::Text(
+                error_msg.to_string().into(),
+            ))
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_reset_game(parsed: &serde_json::Value, state: &Arc<AppState>) -> Result<()> {
+    let game_id = parsed["game_id"].as_str().unwrap_or("").to_string();
+    info!("📥 Received RESET_GAME request - Game ID: {}", game_id);
+
+    let mut games = state.games.write().await;
+    if let Some(game) = games.get_mut(&game_id) {
+        game.reset();
+        let _ = state.tx.send((game_id.clone(), game.clone()));
+        info!("✅ Game {} has been reset.", game_id);
+    } else {
+        error!("❌ Game ID {} not found for reset.", game_id);
+    }
+
+    Ok(())
 }
 
 // Periodically cleans up inactive games
@@ -321,59 +490,39 @@ async fn cleanup_inactive_games(app_state: Arc<AppState>) {
     let timeout = Duration::from_secs(1800); // 30 minutes
 
     loop {
-        {
-            let mut games = app_state.games.write().await;
-            let before_cleanup = games.len();
-            for (game_id, game) in games.iter_mut() {
-                if game.last_activity.elapsed().unwrap_or(timeout) >= timeout {
-                    game.reset(); // Reset instead of deleting
-                    let _ = app_state.tx.send((game_id.clone(), game.clone()));
-                    info!("Inactive game {} has been reset.", game_id);
-                }
-            }
-            let after_cleanup = games.len();
-            if before_cleanup != after_cleanup {
-                info!(
-                    "Cleaned up inactive games. Remaining games: {}",
-                    after_cleanup
-                );
-            }
+        tokio::time::sleep(Duration::from_secs(600)).await; // Run every 10 min
+
+        let mut games = app_state.games.write().await;
+        let before_cleanup = games.len();
+
+        games.retain(|_, game| game.last_activity.elapsed().unwrap_or(timeout) < timeout);
+
+        if before_cleanup != games.len() {
+            info!("Cleaned up inactive games. Remaining: {}", games.len());
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
 // Handler to create a new game
-async fn create_game_handler(State(state): State<Arc<AppState>>) -> Json<String> {
-    let game_id = Uuid::new_v4().to_string();
-    let mut games = state.games.write().await;
-    games.insert(game_id.clone(), Game::default());
-    info!("New game created with ID: {}", game_id);
-    Json(game_id)
-}
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("info"))
+        .init();
 
-    let (tx, _) = broadcast::channel(100);
+    let (tx, _) = broadcast::channel(500);
     let app_state = Arc::new(AppState {
         games: Arc::new(RwLock::new(HashMap::new())),
         tx,
     });
 
     let app = Router::new()
-        .route("/create_game", post(create_game_handler))
-        .route("/state", post(get_state_handler))
-        .route("/make_move", post(make_move_handler))
-        .route("/reset", post(reset_handler))
-        .route("/join_game", post(join_game_handler))
         .route("/ws", get(ws_handler))
         .with_state(Arc::clone(&app_state));
 
-    // Use the PORT environment variable provided by Render
-    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    // let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:3000");
 
     let listener = TcpListener::bind(&addr)
         .await
@@ -382,7 +531,7 @@ async fn main() {
     info!("Server is running on {}", listener.local_addr().unwrap());
 
     tokio::spawn(cleanup_inactive_games(Arc::clone(&app_state)));
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+        error!("❌ Server error: {}", e);
+    }
 }

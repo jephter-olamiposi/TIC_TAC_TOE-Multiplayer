@@ -1,25 +1,39 @@
 use eframe::egui;
-use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use tracing::{debug, error, info};
-use tungstenite::{connect, Message};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+use futures_util::stream::StreamExt;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::SinkExt;
+
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
+
+use std::time::Instant;
+use tracing::{error, info};
+use tracing_subscriber::fmt;
+use tungstenite::Message;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Player {
     X,
     O,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Game {
     pub board: [[Option<Player>; 3]; 3],
     pub current_turn: Player,
     pub game_over: bool,
     pub draw: bool,
     pub players: Vec<Player>,
+    pub player_names: HashMap<Player, String>, // NEW: Player::X => "Bima", Player::O => "Redwan"
+    pub scores: HashMap<Player, u32>,
 }
 
 impl Default for Game {
@@ -30,22 +44,43 @@ impl Default for Game {
             game_over: false,
             draw: false,
             players: Vec::new(),
+            player_names: HashMap::new(),
+            scores: HashMap::from([(Player::X, 0), (Player::O, 0)]),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct GameService {
-    client: Client,
     server_url: String,
     game: Arc<Mutex<Game>>,
+    player: Arc<Mutex<Option<Player>>>,
+    connected: Arc<Mutex<bool>>,
+    game_id: Arc<Mutex<String>>,
+    socket: Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    last_ping_time: Arc<Mutex<Option<Instant>>>,
+
+    socket_write:
+        Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>>,
+    socket_read: Arc<Mutex<Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
+    player_name: Arc<Mutex<String>>,
 }
 
 impl GameService {
     pub fn new(server_url: String) -> Self {
+        let socket = Arc::new(Mutex::new(None));
+
         Self {
-            client: Client::new(),
             server_url,
             game: Arc::new(Mutex::new(Game::default())),
+            player: Arc::new(Mutex::new(None)),
+            connected: Arc::new(Mutex::new(false)),
+            socket,
+            game_id: Arc::new(Mutex::new(String::new())),
+            last_ping_time: Arc::new(Mutex::new(None)),
+            socket_write: Arc::new(Mutex::new(None)),
+            socket_read: Arc::new(Mutex::new(None)),
+            player_name: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -53,448 +88,504 @@ impl GameService {
         Arc::clone(&self.game)
     }
 
-    pub fn create_game(&self) -> Result<String, String> {
-        let response = self
-            .client
-            .post(format!("{}/create_game", self.server_url))
-            .send()
-            .map_err(|e| {
-                error!("failed to create gamee : {:?}", e);
-                e.to_string()
-            })?;
+    pub async fn is_connected(&self) -> bool {
+        let mut socket_guard = self.socket.lock().await;
+        let mut socket_write_guard = self.socket_write.lock().await;
 
-        response.json::<String>().map_err(|e| e.to_string())
+        // Check if socket and writer exist
+        if socket_guard.is_some() && socket_write_guard.is_some() {
+            // Try to send a ping
+            if let Some(socket) = socket_guard.as_mut() {
+                match socket.send(Message::Ping(vec![].into())).await {
+                    Ok(_) => {
+                        *self.last_ping_time.lock().await = Some(Instant::now());
+                        true
+                    }
+                    Err(_) => {
+                        // Clear socket references on error
+                        *socket_guard = None;
+                        *socket_write_guard = None;
+                        *self.connected.lock().await = false;
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
-    pub fn join_game(&self, game_id: &str, player: Option<Player>) -> Result<Player, String> {
-        debug!(
-            "Attempting to join game ID: {} with requested player: {:?}",
-            game_id, player
+
+    pub async fn get_player(&self) -> Option<Player> {
+        let timeout = Instant::now() + Duration::from_secs(5);
+
+        while Instant::now() < timeout {
+            if let Some(player) = self.player.try_lock().ok().and_then(|p| *p) {
+                return Some(player);
+            }
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        None
+    }
+
+    pub async fn start_websocket(
+        &self,
+        game_id: String,
+        player_name: String,
+        ctx: Arc<egui::Context>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut connected = self.connected.lock().await;
+
+        let socket_alive = self.socket_write.lock().await.is_some();
+        if *connected && socket_alive {
+            info!("✅ WebSocket already running.");
+            return Ok(());
+        }
+
+        *connected = true;
+        drop(connected);
+
+        let websocket_url = format!(
+            "{}/ws",
+            self.server_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://")
         );
 
+        // ✅ connect and split immediately
+        let (stream, _) = connect_async(&websocket_url).await?;
+        let (write, read) = stream.split();
+
+        // ✅ store pieces where needed
+        *self.socket_write.lock().await = Some(write);
+        *self.socket_read.lock().await = Some(read);
+        *self.player_name.lock().await = player_name.clone();
+
         let join_request = serde_json::json!({
+            "type": "JOIN_GAME",
             "game_id": game_id,
-            "player": player.map(|p| match p {
-                Player::X => "X", // ✅ Ensures "X" (uppercase)
-                Player::O => "O", // ✅ Ensures "O" (uppercase)
-            }),
+            "name": player_name
         });
 
-        debug!("Final join_game request payload: {}", join_request);
+        if let Some(writer) = &mut *self.socket_write.lock().await {
+            writer
+                .send(Message::Text(join_request.to_string().into()))
+                .await?;
+        }
 
-        let response = self
-            .client
-            .post(format!("{}/join_game", self.server_url))
-            .json(&join_request)
-            .send();
+        let socket_read = self.socket_read.lock().await.take();
+        if let Some(socket_read) = socket_read {
+            let self_clone = Arc::new(self.clone());
+            let ctx_clone = Arc::clone(&ctx);
 
-        response
-            .map_err(|e| {
-                error!("Network error while trying to join game: {}", e);
-                e.to_string()
-            })
-            .and_then(|resp| {
-                let status_code = resp.status();
-                let raw_body = resp
-                    .text()
-                    .unwrap_or_else(|_| "<empty response body>".to_string());
-
-                debug!(
-                    "🔍 Server responded with status {}. Response body: {}",
-                    status_code, raw_body
-                );
-
-                if !status_code.is_success() {
-                    error!(
-                        "Join game failed: Server returned {}. Response: {}",
-                        status_code, raw_body
-                    );
-                    return Err(format!(
-                        "Failed to join game: Server returned {}. Details: {}",
-                        status_code, raw_body
-                    ));
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.listen_for_messages(socket_read, ctx_clone).await {
+                    error!("Error in WebSocket listener: {:?}", e);
                 }
+            });
+        }
 
-                // ✅ Ensure correct JSON parsing
-                let parsed_response: serde_json::Value =
-                    serde_json::from_str(&raw_body).map_err(|e| {
-                        error!("Failed to parse join game response: {}", e);
-                        e.to_string()
-                    })?;
-
-                debug!("Parsed join_game response: {:?}", parsed_response);
-
-                match parsed_response.get("Ok").and_then(|v| v.as_str()) {
-                    Some(player) if player.eq_ignore_ascii_case("x") => {
-                        info!("Successfully joined game ID: {} as player X", game_id);
-                        Ok(Player::X)
-                    }
-                    Some(player) if player.eq_ignore_ascii_case("o") => {
-                        info!("Successfully joined game ID: {} as player O", game_id);
-                        Ok(Player::O)
-                    }
-                    _ => {
-                        let error_details = parsed_response
-                            .get("Err")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("Unexpected response format");
-                        error!("Unexpected response format from server: {}", error_details);
-                        Err(format!(
-                            "Unexpected response format from server: {}",
-                            error_details
-                        ))
-                    }
-                }
-            })
+        Ok(())
     }
 
-    pub fn fetch_game_state(&self, game_id: &str, ctx: &egui::Context) -> Result<(), String> {
-        let request_payload = serde_json::json!({ "game_id": game_id });
-
-        debug!("📤 Sending fetch_game_state request: {}", request_payload);
-
-        let response = self
-            .client
-            .post(format!("{}/state", self.server_url))
-            .json(&request_payload)
-            .send();
-
-        response
-            .map_err(|e| {
-                error!("❌ Network error while fetching game state: {}", e);
-                e.to_string()
-            })
-            .and_then(|resp| {
-                let status_code = resp.status();
-                let response_text = resp
-                    .text()
-                    .unwrap_or_else(|_| "<empty response>".to_string());
-
-                debug!(
-                    "📥 Server responded with status {} for fetch_game_state. Response: {}",
-                    status_code, response_text
-                );
-
-                if !status_code.is_success() {
-                    error!(
-                        "❌ Fetch game state failed - Status: {}, Response: {}",
-                        status_code, response_text
-                    );
-                    return Err(format!("Server error: {}", status_code));
-                }
-
-                match serde_json::from_str::<Game>(&response_text) {
-                    Ok(new_game) => {
-                        debug!("✅ Successfully fetched game state: {:?}", new_game);
-                        let mut game = self.game.lock().unwrap();
-                        *game = new_game;
-
-                        // ✅ Force UI update
-                        ctx.request_repaint();
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("❌ JSON parse error when fetching game state: {}", e);
-                        Err(e.to_string())
-                    }
-                }
-            })
-    }
-
-    pub fn make_move(
+    pub async fn reconnect(
         &self,
-        game_id: &str,
+        game_id: String,
+        ctx: Arc<egui::Context>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let max_attempts = 5;
+
+        for attempt in 1..=max_attempts {
+            {
+                let mut is_connected = self.connected.lock().await;
+                if *is_connected {
+                    return Ok(());
+                }
+                *is_connected = true;
+            }
+
+            let websocket_url = self
+                .server_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://")
+                + "/ws";
+
+            match connect_async(&websocket_url).await {
+                Ok((socket, _)) => {
+                    info!("✅ Reconnected successfully.");
+                    let (write, read) = socket.split();
+                    *self.socket_write.lock().await = Some(write);
+                    *self.socket_read.lock().await = Some(read);
+
+                    let player_name = self.player_name.lock().await.clone();
+                    let join_request = serde_json::json!({
+                        "type": "JOIN_GAME",
+                        "game_id": game_id,
+                        "name": player_name
+                    });
+
+                    if let Some(writer) = &mut *self.socket_write.lock().await {
+                        writer
+                            .send(Message::Text(join_request.to_string().into()))
+                            .await?;
+                    }
+
+                    if let Some(socket_read) = self.socket_read.lock().await.take() {
+                        let ctx_clone = Arc::clone(&ctx);
+                        let self_clone = Arc::new(self.clone());
+
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                self_clone.listen_for_messages(socket_read, ctx_clone).await
+                            {
+                                error!("❌ Error after reconnect: {:?}", e);
+                            }
+                        });
+                    }
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("❌ Reconnection attempt {} failed: {}", attempt, e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+
+        error!("❌ Reached max reconnection attempts.");
+        *self.connected.lock().await = false;
+        Err("Max reconnection attempts reached".into())
+    }
+
+    async fn listen_for_messages(
+        &self,
+        mut socket_read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        ctx: Arc<egui::Context>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        while let Some(message) = socket_read.next().await {
+            match message? {
+                Message::Text(text) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+
+                    match parsed["type"].as_str() {
+                        Some("JOIN_SUCCESS") => {
+                            if let Some(received_game_id) = parsed["game_id"].as_str() {
+                                *self.game_id.lock().await = received_game_id.to_string();
+                            }
+
+                            if let Some(player_str) = parsed["player"].as_str() {
+                                let player_type = match player_str {
+                                    "X" => Some(Player::X),
+                                    "O" => Some(Player::O),
+                                    _ => None,
+                                };
+
+                                if let Some(p) = player_type {
+                                    *self.player.lock().await = Some(p);
+                                    *self.connected.lock().await = true;
+                                }
+                            }
+                        }
+                        Some("UPDATE_STATE") => {
+                            if let Ok(updated_game) =
+                                serde_json::from_value::<Game>(parsed["game"].clone())
+                            {
+                                *self.game.lock().await = updated_game;
+                                ctx.request_repaint();
+                            }
+                        }
+                        _ => error!("⚠️ Unknown message type: {}", text),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        error!("❌ WebSocket connection lost.");
+        *self.connected.lock().await = false;
+
+        Ok(())
+    }
+    pub async fn join_game(&self, game_id: String, player_name: String, ctx: Arc<egui::Context>) {
+        let result = self.start_websocket(game_id, player_name, ctx).await;
+        if let Err(e) = result {
+            error!("Failed to join game: {:?}", e);
+        }
+    }
+
+    pub async fn make_move(
+        &self,
+        game_id: String,
         player: Player,
         row: usize,
         col: usize,
-        ctx: &egui::Context,
-    ) -> Result<(), String> {
+        ctx: Arc<egui::Context>,
+    ) {
+        if game_id.trim().is_empty() {
+            error!("❌ Cannot make a move: Game ID is empty!");
+            return;
+        }
+
         let move_request = serde_json::json!({
+            "type": "MAKE_MOVE",
             "game_id": game_id,
-            "player": format!("{:?}", player), // ✅ Ensures "X" or "O"
+            "player": match player {
+                Player::X => "X",
+                Player::O => "O",
+            },
             "x": row,
             "y": col
         });
 
-        debug!("Sending make_move request: {:?}", move_request);
+        info!("📤 Attempting to send MOVE request...");
 
-        let response = self
-            .client
-            .post(format!("{}/make_move", self.server_url))
-            .json(&move_request)
-            .send();
+        // Ensure connection is active; try to reconnect if not
+        if !self.is_connected().await {
+            error!("🔌 WebSocket is disconnected. Trying to reconnect...");
 
-        response
-            .map_err(|e| {
-                error!("Failed to make move: {}", e);
-                e.to_string()
-            })
-            .and_then(|resp| {
-                let status_code = resp.status();
-                let response_text = resp
-                    .text()
-                    .unwrap_or_else(|_| "<empty response>".to_string());
+            if let Err(e) = self.reconnect(game_id.clone(), ctx.clone()).await {
+                error!("❌ Reconnection failed: {}", e);
+                return;
+            }
 
-                if status_code.is_success() {
-                    debug!("Move successful, fetching latest game state...");
-                    self.fetch_game_state(game_id, ctx).map(|_| ())
+            // After reconnecting, let the server catch up (OPTIONAL delay)
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        // Attempt to send the move
+        match self.socket_write.lock().await.as_mut() {
+            Some(writer) => {
+                if let Err(e) = writer
+                    .send(Message::Text(move_request.to_string().into()))
+                    .await
+                {
+                    error!("❌ Failed to send MOVE request: {}", e);
                 } else {
-                    error!(
-                        "Make move failed: Server returned {}. Response: {}",
-                        status_code, response_text
+                    info!(
+                        "✅ MOVE request sent: Player {:?} -> ({}, {})",
+                        player, row, col
                     );
-                    Err(format!(
-                        "Make move failed: Server returned {}. Details: {}",
-                        status_code, response_text
-                    ))
-                }
-            })
-    }
-
-    pub fn reset_game(&self, game_id: &str) -> Result<(), String> {
-        let response = self
-            .client
-            .post(format!("{}/reset", self.server_url))
-            .json(&game_id)
-            .send();
-
-        response.map_err(|e| e.to_string()).and_then(|resp| {
-            if resp.status().is_success() {
-                let mut game = self.game.lock().unwrap();
-                *game = Game::default();
-                info!("Game with ID: {} has been reset", game_id);
-                Ok(())
-            } else {
-                Err(format!("Server error: {}", resp.status()))
-            }
-        })
-    }
-
-    pub fn start_websocket_listener(&self, game_id: String, ctx: Arc<egui::Context>) {
-        let game_clone = self.get_game();
-        let websocket_url = self
-            .server_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://")
-            + "/ws";
-
-        info!("Connecting to WebSocket at: {}", websocket_url);
-
-        thread::spawn(move || {
-            let mut retries = 0;
-            let max_retries = 5;
-            let backoff_duration = Duration::from_secs(2);
-
-            loop {
-                match connect(&websocket_url) {
-                    Ok((mut socket, _)) => {
-                        info!("WebSocket connected for game ID: {}", game_id);
-                        retries = 0;
-
-                        while let Ok(msg) = socket.read() {
-                            if let Message::Text(text) = msg {
-                                match serde_json::from_str::<(String, Game)>(&text) {
-                                    Ok((received_game_id, received_game))
-                                        if received_game_id == game_id =>
-                                    {
-                                        {
-                                            let mut game = game_clone.lock().unwrap();
-                                            *game = received_game;
-                                        } // ✅ Unlock immediately after updating state
-
-                                        // ✅ Request repaint from the UI thread
-                                        let ctx_clone = Arc::clone(&ctx);
-                                        ctx_clone.request_repaint();
-                                        info!("Game state updated for game ID: {}", game_id);
-                                    }
-                                    Ok(_) => {
-                                        debug!("Received update for a different game, ignoring.")
-                                    }
-                                    Err(e) => error!("Failed to parse WebSocket message: {}", e),
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        retries += 1;
-                        error!(
-                            "WebSocket connection failed: {}. Retry {}/{}",
-                            err, retries, max_retries
-                        );
-
-                        if retries >= max_retries {
-                            error!(
-                                "WebSocket failed to reconnect after {} retries for game ID: {}",
-                                max_retries, game_id
-                            );
-                            break; // Exit loop if max retries reached
-                        }
-
-                        thread::sleep(backoff_duration);
-                    }
                 }
             }
+            None => {
+                error!("❌ No active WebSocket writer. Cannot send move.");
+            }
+        }
+    }
 
-            info!("WebSocket listener stopped for game ID: {}", game_id);
+    pub async fn reset_game(&self) {
+        let game_id = self.game_id.lock().await.clone();
+
+        if !self.is_connected().await {
+            error!("❌ No active WebSocket connection. Attempting to reconnect before reset...");
+
+            let ctx = Arc::new(egui::Context::default());
+
+            if let Err(e) = self.reconnect(game_id.clone(), ctx).await {
+                error!("❌ Failed to reconnect before reset: {}", e);
+                return;
+            }
+        }
+
+        let reset_request = serde_json::json!({
+            "type": "RESET_GAME",
+            "game_id": game_id
         });
+
+        let mut socket_write_guard = self.socket_write.lock().await;
+        if let Some(writer) = socket_write_guard.as_mut() {
+            if let Err(e) = writer
+                .send(Message::Text(reset_request.to_string().into()))
+                .await
+            {
+                error!("❌ Failed to send RESET_GAME request: {}", e);
+            } else {
+                info!("✅ RESET_GAME request sent successfully");
+            }
+        } else {
+            error!("❌ WebSocket writer unavailable");
+        }
     }
 }
 
+#[derive(Clone)]
 pub struct GameApp {
-    game_service: GameService,
-    game_id: String,
+    game_service: Arc<GameService>,
+    game_id: Arc<Mutex<String>>,
     input_game_id: String,
-    joined: bool,
-    loading: bool,
+    input_player_name: String, // ✅ NEW: player's name input
+
+    joined: Arc<Mutex<bool>>,
     error_message: Option<String>,
-    player: Option<Player>,
+    cached_player: Arc<Mutex<Option<Player>>>,
 }
 
 impl Default for GameApp {
     fn default() -> Self {
         Self {
-            game_service: GameService::new(
-                "https://tic-tac-toe-multiplayer-zg0e.onrender.com".to_string(),
-            ),
-            game_id: String::new(),
+            game_service: Arc::new(GameService::new("http://localhost:3000".to_string())),
+            game_id: Arc::new(Mutex::new(String::new())),
             input_game_id: String::new(),
-            joined: false,
-            loading: false,
+            input_player_name: String::new(),
+            joined: Arc::new(Mutex::new(false)),
             error_message: None,
-            player: None,
+            cached_player: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl eframe::App for GameApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let game_service = Arc::clone(&self.game_service);
+        let cached_player = Arc::clone(&self.cached_player);
+        let joined_state = Arc::clone(&self.joined);
+
+        tokio::spawn(async move {
+            if let Some(player) = game_service.get_player().await {
+                if let Ok(mut cached) = cached_player.try_lock() {
+                    *cached = Some(player);
+                }
+            }
+        });
+
+        let joined = joined_state.try_lock().map(|guard| *guard).unwrap_or(false);
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.group(|ui| {
-                    ui.set_width(400.0);
-                    ui.set_height(500.0);
+            self.handle_game_ui(ui, &Arc::new(ctx.clone()), joined);
+        });
+    }
+}
 
-                    // Create Game Section
-                    if ui.button("Create Game").clicked() {
-                        match self.game_service.create_game() {
-                            Ok(game_id) => {
-                                self.game_id = game_id;
-                                self.input_game_id = self.game_id.clone();
-                                info!("New game created with ID: {}", self.game_id);
-                            }
-                            Err(e) => {
-                                self.error_message = Some(format!("Error creating game: {}", e));
-                            }
+impl GameApp {
+    fn handle_game_ui(&mut self, ui: &mut egui::Ui, ctx_arc: &Arc<egui::Context>, joined: bool) {
+        ui.vertical_centered(|ui| {
+            ui.group(|ui| {
+                ui.set_width(400.0);
+                ui.set_height(500.0);
+
+                if !joined {
+                    ui.label("Your Name:");
+                    ui.add_space(3.0);
+                    ui.text_edit_singleline(&mut self.input_player_name);
+                }
+
+                ui.add_space(10.0);
+                ui.label("Game ID:");
+                ui.add_space(3.0);
+                ui.text_edit_singleline(&mut self.input_game_id);
+
+                ui.add_space(10.0);
+
+                let can_join = !self.input_game_id.trim().is_empty()
+                    && !self.input_player_name.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_join,
+                        egui::Button::new("Join Game").min_size(egui::vec2(100.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    let ctx_clone = Arc::clone(ctx_arc);
+                    let game_service_clone = Arc::clone(&self.game_service);
+                    let input_game_id = self.input_game_id.clone();
+                    let player_name = self.input_player_name.clone();
+                    let joined_state = Arc::clone(&self.joined);
+                    let game_id_lock = Arc::clone(&self.game_id);
+
+                    tokio::spawn(async move {
+                        let id = input_game_id.clone();
+                        game_service_clone
+                            .join_game(input_game_id, player_name, ctx_clone)
+                            .await;
+
+                        if let Ok(mut joined) = joined_state.try_lock() {
+                            *joined = true;
                         }
+                        if let Ok(mut game_id) = game_id_lock.try_lock() {
+                            *game_id = id;
+                        }
+                    });
+                }
+                ui.add_space(10.0);
+
+                if let Some(error) = &self.error_message {
+                    ui.colored_label(egui::Color32::RED, error);
+                    ui.add_space(10.0);
+                }
+
+                if joined {
+                    ui.label("🎮 Game in progress...");
+
+                    let player = {
+                        let player_guard = self.cached_player.try_lock().ok();
+                        player_guard.and_then(|p| *p)
+                    };
+
+                    if let Some(player) = player {
+                        self.render_board(ui, ctx_arc, player);
+                    } else {
+                        ui.label("🔄 Waiting for player assignment...");
                     }
 
-                    // Join Game Section
-                    ui.label("Game ID:");
-                    ui.text_edit_singleline(&mut self.input_game_id);
-                    if ui
-                        .add_enabled(!self.loading, egui::Button::new("Join Game"))
-                        .clicked()
-                    {
-                        if !self.input_game_id.is_empty() {
-                            info!(
-                                "Join game button clicked with game ID: {}",
-                                self.input_game_id
-                            );
-                            self.join_game(ctx);
-                        }
-                    }
+                    self.display_game_status(ui);
 
-                    ui.add_space(20.0);
+                    if let Ok(game) = self.game_service.get_game().try_lock() {
+                        if game.game_over {
+                            ctx_arc.request_repaint();
 
-                    // Player Selection Section
-                    if self.player.is_none() {
-                        ui.label("Select Your Player:");
-                        if ui.button("Play as X").clicked() {
-                            match self.game_service.join_game(&self.game_id, Some(Player::X)) {
-                                Ok(player) => {
-                                    if player == Player::X {
-                                        self.player = Some(Player::X);
-                                        info!("Assigned Player X to game {}", self.game_id);
-                                    } else {
-                                        self.error_message =
-                                            Some("Failed to assign Player X.".to_string());
-                                    }
-                                }
-                                Err(e) => {
-                                    self.error_message = Some(format!("Error: {}", e));
-                                }
-                            }
-                        }
-
-                        if ui.button("Play as O").clicked() {
-                            match self.game_service.join_game(&self.game_id, Some(Player::O)) {
-                                Ok(player) => {
-                                    if player == Player::O {
-                                        self.player = Some(Player::O);
-                                        info!("Player O successfully assigned.");
-                                    } else {
-                                        self.error_message =
-                                            Some("Failed to assign Player O.".to_string());
-                                    }
-                                }
-                                Err(e) => {
-                                    self.error_message = Some(format!("Error: {}", e));
-                                }
-                            }
-                        }
-                    }
-
-                    ui.add_space(20.0);
-
-                    // Error Message Section
-                    if let Some(error) = &self.error_message {
-                        ui.colored_label(egui::Color32::RED, error);
-                        ui.add_space(10.0);
-                    }
-
-                    // Game Board and Status
-                    if self.joined && self.player.is_some() {
-                        self.render_board(ui, ctx);
-
-                        ui.add_space(20.0);
-                        self.display_game_status(ui);
-
-                        if self.game_service.get_game().lock().unwrap().game_over {
                             if ui
                                 .add_enabled(
-                                    !self.loading,
+                                    true,
                                     egui::Button::new(
-                                        egui::RichText::new("Reset Game")
+                                        egui::RichText::new("🔄 Reset Game")
                                             .size(30.0)
                                             .color(egui::Color32::from_rgb(240, 148, 0)),
                                     ),
                                 )
                                 .clicked()
                             {
-                                self.reset_game(ctx);
+                                let game_service_clone = Arc::clone(&self.game_service);
+                                tokio::spawn(async move {
+                                    game_service_clone.reset_game().await;
+                                });
                             }
                         }
                     }
-                });
+                }
             });
         });
     }
-}
 
-impl GameApp {
-    fn render_board(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let game = self.game_service.get_game();
+    fn render_board(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: Player) {
+        let game_arc = Arc::clone(&self.game_service.get_game());
+
+        let game = match game_arc.try_lock() {
+            Ok(game) => game,
+            Err(_) => {
+                error!("❌ Failed to acquire game lock in render_board()");
+                return;
+            }
+        };
+
         let button_size = 100.0;
 
-        ui.vertical(|ui| {
+        ui.vertical_centered(|ui| {
             for row in 0..3 {
                 ui.horizontal(|ui| {
                     ui.add_space(40.0);
                     for col in 0..3 {
-                        let cell = game.lock().unwrap().board[row][col];
+                        let cell = game.board[row][col];
+
+                        let can_move =
+                            !game.game_over && player == game.current_turn && cell.is_none();
+
                         let button = ui.add_enabled(
-                            !game.lock().unwrap().game_over
-                                && self.player.is_some()
-                                && self.player.unwrap() == game.lock().unwrap().current_turn,
+                            can_move,
                             egui::Button::new(match cell {
                                 Some(Player::X) => egui::RichText::new("X")
                                     .size(50.0)
@@ -509,10 +600,17 @@ impl GameApp {
                             .min_size(egui::vec2(button_size, button_size)),
                         );
 
-                        if button.clicked() && cell.is_none() {
-                            self.make_move(self.player.unwrap(), row, col, ctx);
+                        if button.clicked() && can_move {
+                            let game_service_clone = Arc::clone(&self.game_service);
+                            let ctx_clone = ctx.clone();
 
-                            // 🔴 Pass ctx here
+                            let game_id_clone = Arc::clone(&self.game_id);
+                            tokio::spawn(async move {
+                                let game_id = game_id_clone.lock().await.clone();
+                                game_service_clone
+                                    .make_move(game_id, player, row, col, ctx_clone.into())
+                                    .await;
+                            });
                         }
                     }
                 });
@@ -521,115 +619,81 @@ impl GameApp {
     }
 
     fn display_game_status(&self, ui: &mut egui::Ui) {
-        let game = self.game_service.get_game();
-        let game = game.lock().unwrap();
+        if let Ok(game) = self.game_service.get_game().try_lock() {
+            let name_x = game
+                .player_names
+                .get(&Player::X)
+                .cloned()
+                .unwrap_or("X".to_string());
+            let name_o = game
+                .player_names
+                .get(&Player::O)
+                .cloned()
+                .unwrap_or("O".to_string());
 
-        if game.game_over {
-            let status_message = if game.draw {
-                "It's a draw!".to_string()
-            } else {
-                format!("{:?} wins!", game.current_turn)
-            };
+            let score_x = game.scores.get(&Player::X).cloned().unwrap_or(0);
+            let score_o = game.scores.get(&Player::O).cloned().unwrap_or(0);
+
+            let score_text = format!("{name_x} {} : {} {name_o}", score_x, score_o);
+
             ui.label(
-                egui::RichText::new(status_message)
-                    .size(30.0)
-                    .color(egui::Color32::from_rgb(255, 0, 0)),
+                egui::RichText::new(score_text)
+                    .size(24.0)
+                    .color(egui::Color32::from_rgb(0, 191, 255)), // Light Blue
             );
-        } else {
-            let turn_message = format!("{:?}'s turn", game.current_turn);
-            ui.label(
-                egui::RichText::new(turn_message)
-                    .size(30.0)
-                    .color(egui::Color32::from_rgb(0, 255, 0)),
-            );
-        }
-    }
 
-    fn join_game(&mut self, ctx: &egui::Context) {
-        self.loading = true;
-        self.error_message = None;
-        self.game_id = self.input_game_id.clone();
+            ui.add_space(10.0);
 
-        info!("Attempting to join game with ID: {}", self.game_id);
+            if game.game_over {
+                let status_message = if game.draw {
+                    "It's a draw!".to_string()
+                } else {
+                    let winner_name = game
+                        .player_names
+                        .get(&game.current_turn)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{:?}", game.current_turn));
 
-        match self.game_service.join_game(&self.game_id, None) {
-            Ok(player) => {
-                self.player = Some(player);
-                self.joined = true;
+                    format!("🏆 {} wins!", winner_name)
+                };
 
-                if let Err(e) = self.game_service.fetch_game_state(&self.game_id, ctx) {
-                    error!("Failed to fetch game state: {}", e);
-                    self.error_message = Some(format!("Failed to fetch game state: {}", e));
-                    self.loading = false;
-                    return;
-                }
-
-                self.game_service
-                    .start_websocket_listener(self.game_id.clone(), Arc::new(ctx.clone()));
-
-                info!("✅ Successfully joined game with ID: {}", self.game_id);
-            }
-            Err(e) => {
-                error!("❌ Failed to join game: {}", e);
-                self.error_message = Some(format!("Failed to join game: {}", e));
-            }
-        }
-
-        self.loading = false;
-    }
-    fn make_move(&mut self, player: Player, row: usize, col: usize, ctx: &egui::Context) {
-        if self.loading {
-            return;
-        }
-
-        info!(
-            "⏳ Attempting to make move - Player: {:?}, Position: ({}, {}), Game ID: {}",
-            player, row, col, self.game_id
-        );
-
-        match self
-            .game_service
-            .make_move(&self.game_id, player, row, col, ctx)
-        {
-            Ok(_) => {
-                info!("✅ Move successful! Fetching latest game state...");
-                if let Err(e) = self.game_service.fetch_game_state(&self.game_id, ctx) {
-                    error!("❌ Failed to fetch updated game state: {}", e);
-                    self.error_message = Some(format!("Failed to fetch game state: {}", e));
-                }
-            }
-            Err(e) => {
-                error!(
-                    "❌ Move failed - Player: {:?}, Position: ({}, {}), Error: {}",
-                    player, row, col, e
+                ui.label(
+                    egui::RichText::new(status_message)
+                        .size(30.0)
+                        .color(egui::Color32::from_rgb(255, 0, 0)), // 🔴 red
                 );
-                self.error_message = Some(format!("Error making move: {}", e));
+            } else {
+                let current_turn_name = game
+                    .player_names
+                    .get(&game.current_turn)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", game.current_turn));
+
+                let turn_message = format!("🕐 {}'s turn", current_turn_name);
+
+                ui.label(
+                    egui::RichText::new(turn_message)
+                        .size(30.0)
+                        .color(egui::Color32::from_rgb(0, 255, 0)), // 🟢 green
+                );
             }
-        }
-    }
-
-    fn reset_game(&mut self, ctx: &egui::Context) {
-        self.loading = true;
-        self.error_message = None;
-
-        info!("Resetting game with ID: {}", self.game_id);
-
-        if let Err(e) = self.game_service.reset_game(&self.game_id) {
-            self.error_message = Some(format!("Error resetting game: {}", e));
         } else {
-            self.game_service
-                .fetch_game_state(&self.game_id, ctx)
-                .unwrap();
+            ui.colored_label(egui::Color32::RED, "⚠️ Unable to fetch game state.");
         }
-
-        self.loading = false;
     }
 }
 
-fn main() -> Result<(), eframe::Error> {
-    eframe::run_native(
-        "Tic-Tac-Toe (Multiplayer)",
+#[tokio::main]
+async fn main() {
+    fmt::init();
+
+    info!("🚀 Starting Tic-Tac-Toe Client...");
+
+    if let Err(e) = eframe::run_native(
+        "Tic-Tac-Toe",
         eframe::NativeOptions::default(),
         Box::new(|_cc| Ok(Box::new(GameApp::default()))),
-    )
+    ) {
+        eprintln!("❌ Application crashed: {:?}", e);
+    }
 }
