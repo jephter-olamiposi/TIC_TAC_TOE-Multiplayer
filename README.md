@@ -1,6 +1,7 @@
 # 🧠 Tic-Tac-Toe Multiplayer (Rust)
 
-A real-time multiplayer Tic-Tac-Toe game written entirely in Rust, using a native GUI (`egui`) and a WebSocket server (`axum`). Built to showcase  stateful game logic, async networking, real-time game logic, reconnection handling, and proper client-server architecture. 
+A real-time multiplayer Tic-Tac-Toe game built fully in Rust — featuring a native UI (`egui`) and a WebSocket server (`axum`).   Designed for smooth async gameplay, resilient reconnections, clean state management and proper client-server architecture. 
+
 
 ---
 
