@@ -13,7 +13,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.26.1"
 uuid = { version = "1.12.1", features = ["v4"] }
-tower-http = { version = "0.6.2", features = ["cors"] }
+tower-http =  "0.6.2"
 prometheus = "0.13.4"
 futures-util = "0.3"
-anyhow = "1.0.95"
+anyhow = "1.0"
