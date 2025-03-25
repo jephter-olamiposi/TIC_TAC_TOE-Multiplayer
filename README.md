@@ -10,7 +10,7 @@ A real-time multiplayer Tic-Tac-Toe game written entirely in Rust, using a nativ
 - Player name input and live scoreboard
 - Clean turn-based logic with win/draw detection
 - Game state is kept in sync across clients
-- WebSocket to /ws, real-time JSON sync, auto-reconnect.
+- WebSocket to /ws, real-time JSON sync
 - Uses **SplitSink** and **SplitStream** to cleanly separate read/write WebSocket channels
 - Server state stored with **RwLock<HashMap<String, Game>>** for concurrent safety
 - Built-in auto-reconnect if connection drops
@@ -36,7 +36,6 @@ A real-time multiplayer Tic-Tac-Toe game written entirely in Rust, using a nativ
 - `tungstenite` → low-level WS protocol
 - `tower` / `tower-http` → layering and HTTP support
 - `anyhow` → error propagation
-- `uuid` → (for future room IDs)
 
 ---
 
@@ -58,9 +57,21 @@ Server sends updates via broadcast, so all clients stay in sync.
 
 ## 4. 🖼️ Screenshots
 
-| Join Game | Gameplay | Result Screen |
-|-----------|----------|----------------|
-| ![Join](assets/joining.png) | ![Game](assets/make_move.png) | ![Win](assets/win.png) |
+| Join Game 
+----
+
+![Join](assets/joining.png) |
+
+----
+| Gameplay 
+
+![Game](assets/make_move.png) |
+
+----
+
+| Win 
+
+ ![Win](assets/win.png) |
 
 *UI is minimal and focused — built with egui.*
 
