@@ -57,20 +57,18 @@ Server sends updates via broadcast, so all clients stay in sync.
 
 ## 4. 🖼️ Screenshots
 
-| Join Game 
+ Join Game 
 ----
 
 ![Join](assets/joining.png) |
 
-----
-| Gameplay 
+--
+ Gameplay 
 
 ![Game](assets/make_move.png) |
 
-----
-
-| Win 
-
+--
+Win 
  ![Win](assets/win.png) |
 
 *UI is minimal and focused — built with egui.*
