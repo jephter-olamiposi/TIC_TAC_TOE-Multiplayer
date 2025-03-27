@@ -82,7 +82,7 @@ cd tic_tac_toe_client
 cargo run
 ```
 
-You can change the WebSocket URL in `GameService` if you want to connect to production.
+You can change the WebSocket URL in `GameApp` if you want to connect locally.
 
 ---
 
